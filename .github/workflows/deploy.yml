@@ -1,0 +1,46 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency: catalyst-deploy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build AppSail bundle (vendored deps for manylinux/cp312)
+        run: sh catalyst/scripts/build_appsail.sh
+      - name: Deploy to Catalyst
+        working-directory: catalyst
+        run: |
+          npm install -g zcatalyst-cli
+          catalyst --token "$CATALYST_TOKEN" --project SplitLLM --org 60078340202 --dc in deploy --ignore-scripts
+        env:
+          CATALYST_TOKEN: ${{ secrets.CATALYST_TOKEN }}

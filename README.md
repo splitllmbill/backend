@@ -153,3 +153,55 @@ Once running, visit:
 
 > On Cloud Run, `MONGODB_URI` should be provided via **Secret Manager**;
 > the rest are plain env vars. Locally they all come from `.env`.
+
+## Deployment (Zoho Catalyst AppSail)
+
+The API runs as an AppSail service in the Catalyst project **SplitLLM**
+(`46831000000013050`, org `60078340202`, IN DC). Config lives in `catalyst/`:
+
+```
+catalyst/
+├── catalyst.json          # Catalyst project config (appsail only)
+├── .catalystignore
+├── appsail/
+│   ├── app-config.json    # runtime: stack, startup command, env vars
+│   └── build/             # generated bundle (scripts/build_appsail.sh)
+└── scripts/
+    └── build_appsail.sh   # app/ + vendored deps -> appsail/build
+```
+
+### Deploy
+
+```bash
+cd catalyst
+catalyst project:use SplitLLM --org 60078340202   # one-time binding
+catalyst deploy                                   # predeploy runs build_appsail.sh
+```
+
+The AppSail URL is `https://splitllm-api-50044020391.development.catalystappsail.in`
+(`/health` should return ok). CI deploys automatically on push to `main`
+(see `.github/workflows/deploy.yml`; needs the `CATALYST_TOKEN` repo secret
+from `catalyst token:generate`).
+
+### Platform gotchas (hard-won — do not re-learn)
+
+- **Env var names must not start with `ZOHO_` or `CATALYST_`** — AppSail
+  rejects them with a 400 "reserved keywords" error. `app/config.py` maps the
+  `QUICKML_*` / `OAUTH_*` env names onto the original field names via
+  Pydantic `AliasChoices`.
+- **The startup command must be shell-wrapped**:
+  `sh -c '... --port ${X_ZOHO_CATALYST_LISTEN_PORT:-9000}'`. Without `sh -c`
+  the port variable is not expanded and the app fails with "check the startup
+  command or port".
+- **Python deps must be vendored** into the bundle. Catalyst never installs
+  `requirements.txt`; `build_appsail.sh` runs `pip install -t` with
+  `--platform manylinux2014_x86_64 --python-version 3.12 --only-binary=:all:`.
+- Secrets/env values live in `catalyst/appsail/app-config.json`
+  `env_variables` (placeholders) and the Catalyst console — never in the
+  bundle or repo `.env`.
+
+### Free-tier watchpoints
+
+- AppSail: 15 GB-hours/month free — check Billing → Usage after the first week.
+- QuickML LLM serving is token-billed; expect the ~$5/project/month minimum
+  once it exceeds the free tier.

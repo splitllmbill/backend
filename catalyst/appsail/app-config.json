@@ -1,0 +1,34 @@
+{
+    "command": "sh -c 'python3 -m uvicorn app.main:app --host 0.0.0.0 --port ${X_ZOHO_CATALYST_LISTEN_PORT:-9000}'",
+    "build_path": "build",
+    "stack": "python_3_12",
+    "env_variables": {
+        "MONGODB_URI": "SET_ME_mongodb_atlas_srv_uri",
+        "DB_NAME": "splitllm",
+        "SUPABASE_URL": "https://jolggtuiatbxrjomfbxl.supabase.co",
+        "SUPABASE_ANON_KEY": "sb_publishable_Y-dpGB63ipwupP3Y3-6HAw_6d6w3wpO",
+        "CORS_ORIGINS": "https://splitllm.com,https://www.splitllm.com,https://splitllm-60078340202.development.catalystserverless.in",
+        "DEFAULT_CURRENCY": "INR",
+        "FX_API_URL": "",
+        "APP_BASE_URL": "https://splitllm.com",
+        "LLM_ENABLED": "false",
+        "QUICKML_LLM_ENDPOINT": "",
+        "QUICKML_LLM_MODEL": "glm-4.7-flash",
+        "QUICKML_VLM_ENDPOINT": "",
+        "QUICKML_VLM_MODEL": "qwen3.6-35b-vl",
+        "QUICKML_ORG_ID": "60078340202",
+        "OAUTH_ACCOUNTS_URL": "https://accounts.zoho.in",
+        "OAUTH_CLIENT_ID": "",
+        "OAUTH_CLIENT_SECRET": "",
+        "OAUTH_REFRESH_TOKEN": "",
+        "ZEPTOMAIL_ENABLED": "false",
+        "ZEPTOMAIL_API_URL": "https://api.zeptomail.in",
+        "ZEPTOMAIL_TOKEN": "",
+        "ZEPTOMAIL_FROM_ADDRESS": "noreply@splitllm.com",
+        "ZEPTOMAIL_FROM_NAME": "SplitLLM"
+    },
+    "memory": 512,
+    "scripts": {
+        "predeploy": "sh ../scripts/build_appsail.sh"
+    }
+}

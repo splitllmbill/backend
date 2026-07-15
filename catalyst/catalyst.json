@@ -1,0 +1,8 @@
+{
+    "appsail": [
+        {
+            "source": "appsail",
+            "name": "splitllm-api"
+        }
+    ]
+}

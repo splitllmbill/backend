@@ -31,3 +31,8 @@ service-account*.json
 # Uploads
 uploads/
 .aider*
+
+# Catalyst
+catalyst/appsail/build/
+catalyst/.catalystrc
+catalyst-debug.log

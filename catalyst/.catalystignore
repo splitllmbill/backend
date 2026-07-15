@@ -1,0 +1,3 @@
+# Never ship local/dev artifacts to Catalyst
+appsail/build/requirements.txt
+.DS_Store

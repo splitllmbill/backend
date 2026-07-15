@@ -24,16 +24,29 @@ async def _seed_database(db: AsyncIOMotorDatabase):
     await db.users.create_index([("friendCode", pymongo.ASCENDING)], unique=True, sparse=True)
 
 async def connect_to_mongo():
-    """Initialize MongoDB connection on app startup."""
+    """Initialize MongoDB connection on app startup.
+
+    A failed ping logs a warning instead of crashing the process, so the app
+    still boots (and /health responds) when the database is unreachable or not
+    yet configured — DB-backed endpoints will error per-request until it is.
+    """
     global _client, _db
-    _client = AsyncIOMotorClient(settings.MONGODB_URI)
+    _client = AsyncIOMotorClient(
+        settings.MONGODB_URI, serverSelectionTimeoutMS=5000
+    )
     _db = _client[settings.DB_NAME]
-    # Verify connection
-    await _client.admin.command("ping")
-    print(f"Connected to MongoDB: {settings.DB_NAME}")
-    
-    # Run seeders
-    await _seed_database(_db)
+    try:
+        # Verify connection
+        await _client.admin.command("ping")
+        print(f"Connected to MongoDB: {settings.DB_NAME}")
+
+        # Run seeders
+        await _seed_database(_db)
+    except Exception as e:
+        print(
+            f"WARNING: MongoDB not reachable at startup ({e}); "
+            "continuing without a verified connection"
+        )
 
 
 async def close_mongo_connection():

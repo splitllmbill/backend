@@ -6,6 +6,8 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from argon2 import PasswordHasher
 from fastapi import HTTPException
 
+from app.config import settings
+
 ph = PasswordHasher()
 
 
@@ -22,24 +24,28 @@ def generate_friend_code(length: int = 8) -> str:
     return "".join(code_list)
 
 
+def _serialize_value(value):
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_serialize_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _serialize_value(v) for k, v in value.items()}
+    return value
+
+
 def serialize_doc(doc: dict) -> dict:
-    """Convert MongoDB document to JSON-serializable dict."""
+    """Convert MongoDB document to JSON-serializable dict (recursively)."""
     if doc is None:
         return None
     result = {}
     for key, value in doc.items():
         if key == "_id":
             result["id"] = str(value)
-        elif isinstance(value, ObjectId):
-            result[key] = str(value)
-        elif isinstance(value, datetime):
-            result[key] = value.isoformat()
-        elif isinstance(value, list):
-            result[key] = [
-                str(v) if isinstance(v, ObjectId) else v for v in value
-            ]
         else:
-            result[key] = value
+            result[key] = _serialize_value(value)
     return result
 
 
@@ -103,6 +109,7 @@ async def find_or_create_user(
         "name": name or email.split("@")[0],
         "friendCode": friend_code,
         "upiId": "",
+        "defaultCurrency": settings.DEFAULT_CURRENCY,
         "friends": [],
         "password": password_hash,
         "role": role,
@@ -145,6 +152,52 @@ async def find_or_create_user(
         await link_phantom_expenses(db, email, str(updated_user["_id"]))
         
         return serialize_doc(updated_user)
+
+
+async def create_phantom_user(
+    db: AsyncIOMotorDatabase, email: str, name: str = ""
+) -> dict:
+    """Find a user by email, or create a placeholder ("phantom") account.
+
+    Phantom users hold shares for people who haven't registered yet; when they
+    sign up with the same email, link_phantom_expenses attaches their history.
+    Unlike find_or_create_user this never requires an invite code.
+    The returned dict has ``wasCreated`` so callers can send invites once.
+    """
+    import uuid as _uuid
+
+    email = email.strip().lower()
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        result = serialize_doc(existing)
+        result["wasCreated"] = False
+        return result
+
+    friend_code = generate_friend_code(8)
+    while await db.users.find_one({"friendCode": friend_code}):
+        friend_code = generate_friend_code(8)
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "firebaseUid": f"phantom_{_uuid.uuid4().hex}",
+        "email": email,
+        "name": name or email.split("@")[0],
+        "friendCode": friend_code,
+        "upiId": "",
+        "defaultCurrency": settings.DEFAULT_CURRENCY,
+        "friends": [],
+        "password": "",
+        "role": "user",
+        "isPhantom": True,
+        "invitedBy": None,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    result = await db.users.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    serialized = serialize_doc(doc)
+    serialized["wasCreated"] = True
+    return serialized
 
 
 async def link_phantom_expenses(db: AsyncIOMotorDatabase, email: str, user_id_str: str):
@@ -205,6 +258,7 @@ async def get_user_account(db: AsyncIOMotorDatabase, uid: str) -> dict | None:
         "name": user.get("name", ""),
         "friendCode": friend_code,
         "upiId": user.get("upiId", ""),
+        "defaultCurrency": user.get("defaultCurrency", settings.DEFAULT_CURRENCY),
         "uuid": friend_code,
         "role": user.get("role", "user"),
         "invitedBy": user.get("invitedBy"),
@@ -214,12 +268,19 @@ async def get_user_account(db: AsyncIOMotorDatabase, uid: str) -> dict | None:
 async def update_user_account(
     db: AsyncIOMotorDatabase, uid: str, data: dict
 ) -> bool:
-    """Update user account fields (name, upiId)."""
+    """Update user account fields (name, upiId, defaultCurrency)."""
+    from app.services import fx_service
+
     update_fields = {"updatedAt": datetime.now(timezone.utc)}
     if "name" in data and data["name"]:
         update_fields["name"] = data["name"]
     if "upiId" in data and data["upiId"] is not None:
         update_fields["upiId"] = data["upiId"]
+    if data.get("defaultCurrency"):
+        currency = data["defaultCurrency"].strip().upper()
+        if currency not in fx_service.SUPPORTED_CURRENCIES:
+            raise HTTPException(status_code=400, detail="Unsupported currency")
+        update_fields["defaultCurrency"] = currency
 
     result = await db.users.update_one(
         {"firebaseUid": uid}, {"$set": update_fields}

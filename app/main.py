@@ -16,6 +16,8 @@ from app.routers import (
     llm_router,
     admin_router,
     issues_router,
+    fx_router,
+    import_router,
 )
 
 
@@ -91,6 +93,12 @@ app.include_router(admin_router.router, prefix="/db/admin", tags=["Admin"])
 
 # Issues routes: /db/issues
 app.include_router(issues_router.router, prefix="/db/issues", tags=["Issues"])
+
+# FX routes: /db/fx/currencies, /db/fx/rate
+app.include_router(fx_router.router, prefix="/db", tags=["FX"])
+
+# Import routes: /db/import/splitwise, /db/import/splitwise/preview
+app.include_router(import_router.router, prefix="/db/import", tags=["Import"])
 
 
 # ─── Health Check ───────────────────────────────────────────────────────

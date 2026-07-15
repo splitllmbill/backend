@@ -1,11 +1,58 @@
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_current_user
 from app.database import get_db
-from app.services import expense_service, user_service
+from app.services import email_service, expense_service, user_service
 from app.models.schemas import PersonalExpensesRequest, ExpenseCreate, ExpenseUpdate
 
 router = APIRouter()
+
+
+async def _notify_expense_members(
+    db: AsyncIOMotorDatabase, creator_id: str, creator_name: str, expense: dict
+):
+    """Email everyone involved in a new shared expense (except the creator)."""
+    if expense.get("type") == "normal":
+        return
+
+    member_ids = {
+        s.get("userId")
+        for s in expense.get("shares", []) + expense.get("payShares", [])
+        if s.get("userId")
+    }
+    member_ids.discard(creator_id)
+    if not member_ids:
+        return
+
+    event_name = None
+    if expense.get("eventId"):
+        event = await db.event.find_one(
+            {"_id": ObjectId(expense["eventId"])}, {"eventName": 1}
+        )
+        event_name = (event or {}).get("eventName")
+
+    users = await db.users.find(
+        {"_id": {"$in": [ObjectId(mid) for mid in member_ids]}},
+        {"email": 1, "name": 1},
+    ).to_list(length=None)
+
+    for member in users:
+        if not member.get("email"):
+            continue
+        email_service.send_in_background(
+            email_service.send_expense_notification(
+                to_email=member["email"],
+                to_name=member.get("name", ""),
+                creator_name=creator_name,
+                expense_name=expense.get("expenseName", ""),
+                amount=float(
+                    expense.get("originalAmount", expense.get("amount", 0))
+                ),
+                currency=expense.get("currency", ""),
+                event_name=event_name,
+            )
+        )
 
 
 @router.post("/expense")
@@ -22,6 +69,10 @@ async def create_expense(
     request_data = request.model_dump(by_alias=True)
     try:
         result = await expense_service.create_expense(db, user_id, request_data)
+        if result.get("success") == "true":
+            await _notify_expense_members(
+                db, user_id, current_user.get("name", ""), result.get("data", {})
+            )
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

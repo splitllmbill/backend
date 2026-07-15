@@ -2,10 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_current_user
 from app.database import get_db
-from app.services import user_service
+from app.services import email_service, user_service
 from app.models.schemas import UpdateAccountRequest
 from pydantic import BaseModel
-import uuid
 
 class PhantomUserRequest(BaseModel):
     email: str
@@ -43,7 +42,7 @@ async def update_account(
     )
     if not result:
         raise HTTPException(status_code=500, detail="Failed to update account details")
-    return {"message": "Success"}
+    return {"message": "Account updated successfully"}
 
 @router.get("/user/invites")
 async def get_invites(
@@ -64,16 +63,16 @@ async def create_phantom_user(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Create or find a phantom user by email."""
-    # First check if user exists
-    user = await db.users.find_one({"email": request.email})
-    if user:
-        return user_service.serialize_doc(user)
-        
-    # Generate random uid for phantom
-    phantom_uid = f"phantom_{uuid.uuid4().hex}"
-    
-    user = await user_service.find_or_create_user(
-        db, uid=phantom_uid, email=request.email, name=request.name or request.email.split("@")[0]
+    user = await user_service.create_phantom_user(
+        db, email=request.email, name=request.name
     )
+    if user.pop("wasCreated", False):
+        email_service.send_in_background(
+            email_service.send_invite_email(
+                to_email=request.email,
+                to_name=user.get("name", ""),
+                inviter_name=current_user.get("name", ""),
+            )
+        )
     return user
 

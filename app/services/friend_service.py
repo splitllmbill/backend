@@ -2,7 +2,26 @@ from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from collections import defaultdict
 from datetime import datetime, timezone
-from app.services import expense_service
+from app.services import expense_service, fx_service
+
+
+async def _viewer_currency(db: AsyncIOMotorDatabase, user_id: str) -> str:
+    user = await db.users.find_one({"_id": ObjectId(user_id)}, {"defaultCurrency": 1})
+    return fx_service.normalize_currency((user or {}).get("defaultCurrency"))
+
+
+async def _base_to_viewer_rates(
+    db: AsyncIOMotorDatabase, expenses: list, viewer_currency: str
+) -> dict[str, float]:
+    """Current rates from each expense's base currency to the viewer currency."""
+    bases = {
+        fx_service.normalize_currency(e.get("baseCurrency")) for e in expenses
+    }
+    return await fx_service.get_rates_to(viewer_currency, bases, db=db)
+
+
+def _expense_rate(expense: dict, rates: dict[str, float]) -> float:
+    return rates.get(fx_service.normalize_currency(expense.get("baseCurrency")), 1.0)
 
 
 async def get_friend_list(db: AsyncIOMotorDatabase, user_id: str) -> dict:
@@ -44,8 +63,13 @@ async def get_friend_list(db: AsyncIOMotorDatabase, user_id: str) -> dict:
                 {"payShares.userId": {"$in": friends}},
             ],
         },
-        {"payShares": 1, "shares": 1, "type": 1},
+        {"payShares": 1, "shares": 1, "type": 1, "baseCurrency": 1},
     ).to_list(length=None)
+
+    # Balances span events with different currencies, so each expense is
+    # converted from its base currency to the viewer's currency at current rates.
+    viewer_ccy = await _viewer_currency(db, user_id)
+    rates = await _base_to_viewer_rates(db, expenses, viewer_ccy)
 
     # Compute dues
     friend_dues = defaultdict(float)
@@ -55,10 +79,11 @@ async def get_friend_list(db: AsyncIOMotorDatabase, user_id: str) -> dict:
         total_paid_amount = sum(float(p["amount"]) for p in pay_shares)
         if total_paid_amount == 0:
             continue
+        rate = _expense_rate(expense, rates)
 
         for share in shares:
             share_user_id = str(share["userId"])
-            share_amount = float(share["amount"])
+            share_amount = float(share["amount"]) * rate
 
             for pay in pay_shares:
                 payer_id = str(pay["userId"])
@@ -98,8 +123,9 @@ async def get_friend_list(db: AsyncIOMotorDatabase, user_id: str) -> dict:
 
     return {
         "uuid": user.get("friendCode", ""),
-        "overallYouOwe": float(overall_you_owe),
-        "overallYouAreOwed": float(overall_you_are_owed),
+        "overallYouOwe": round(float(overall_you_owe), 2),
+        "overallYouAreOwed": round(float(overall_you_are_owed), 2),
+        "currency": viewer_ccy,
         "friendsList": friend_list,
     }
 
@@ -134,12 +160,16 @@ async def get_friend_details(
     total_friend_owe = 0
     total_user_owe = 0
 
+    viewer_ccy = await _viewer_currency(db, user_id)
+    rates = await _base_to_viewer_rates(db, expenses, viewer_ccy)
+
     for expense in expenses:
         user_owe = 0
         friend_owe = 0
 
         pay_shares = expense.get("payShares", [])
         shares = expense.get("shares", [])
+        rate = _expense_rate(expense, rates)
 
         user_paid = sum(
             float(ps["amount"])
@@ -160,7 +190,7 @@ async def get_friend_details(
             if total_paid == 0:
                 continue
 
-            share_amount = float(share["amount"])
+            share_amount = float(share["amount"]) * rate
             if share_user_id == user_id:
                 user_owe += share_amount * (friend_paid / total_paid)
             elif share_user_id == friend_id:
@@ -206,8 +236,9 @@ async def get_friend_details(
     return {
         "uuid": friend.get("friendCode", ""),
         "name": friend.get("name", ""),
-        "overallOweAmount": float(total_owe_amount),
+        "overallOweAmount": round(float(total_owe_amount), 2),
         "overallWhoOwes": overall_who_owes,
+        "currency": viewer_ccy,
         "expenses": expenses_list,
     }
 
@@ -229,6 +260,9 @@ async def get_friend_dues(
     total_friend_owe = 0
     total_user_owe = 0
 
+    viewer_ccy = await _viewer_currency(db, user_id)
+    rates = await _base_to_viewer_rates(db, expenses, viewer_ccy)
+
     for expense in expenses:
         user_owe = 0
         friend_owe = 0
@@ -237,9 +271,10 @@ async def get_friend_dues(
         total_paid = sum(float(ps["amount"]) for ps in pay_shares) if pay_shares else 0
         if total_paid == 0:
             continue
+        rate = _expense_rate(expense, rates)
 
         for share in expense.get("shares", []):
-            share_amount = float(share["amount"])
+            share_amount = float(share["amount"]) * rate
             for ps in pay_shares:
                 payer_id = str(ps["userId"])
                 payer_amount = float(ps["amount"])
@@ -264,8 +299,9 @@ async def get_friend_dues(
     return {
         "name": friend.get("name", ""),
         "id": friend_id,
-        "oweAmount": float(total_owe_amount),
+        "oweAmount": round(float(total_owe_amount), 2),
         "whoOwes": overall_who_owes,
+        "currency": viewer_ccy,
     }
 
 

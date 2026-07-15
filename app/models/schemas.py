@@ -36,6 +36,7 @@ class ChangePasswordRequest(BaseModel):
 class UpdateAccountRequest(BaseModel):
     name: Optional[str] = None
     upiId: Optional[str] = None
+    defaultCurrency: Optional[str] = None
 
 
 # ─── Dashboard ──────────────────────────────────────────────────────────
@@ -74,6 +75,7 @@ class EventCreate(BaseModel):
     title: Optional[str] = Field(None, alias="eventName")
     description: str = ""
     members: list[str] = Field(default_factory=list, alias="users")
+    currency: Optional[str] = None
 
     class Config:
         populate_by_name = True
@@ -84,6 +86,7 @@ class EventUpdate(BaseModel):
     title: Optional[str] = Field(None, alias="eventName")
     description: str = ""
     members: list[str] = Field(default_factory=list, alias="users")
+    currency: Optional[str] = None
 
     class Config:
         populate_by_name = True
@@ -121,6 +124,7 @@ class ExpenseCreate(BaseModel):
     friendId: Optional[str] = None
     type: str = "normal"
     date: str = ""
+    currency: Optional[str] = None  # transaction currency; defaults to context currency
     shares: list[ShareModel] = Field(default_factory=list)
     payShares: list[PayShareModel] = Field(default_factory=list)
 
@@ -138,6 +142,7 @@ class ExpenseUpdate(BaseModel):
     eventId: Optional[str] = None
     type: Optional[str] = None
     date: Optional[str] = None
+    currency: Optional[str] = None
     shares: list[ShareModel] = Field(default_factory=list)
     payShares: list[PayShareModel] = Field(default_factory=list)
 

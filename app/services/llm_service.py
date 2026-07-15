@@ -6,14 +6,19 @@ from datetime import datetime, timezone
 from .llm.provider_base import BaseLLMProvider
 from .llm.google_provider import GoogleGeminiProvider
 from .llm.ollama_provider import OllamaProvider
+from .llm.catalyst_provider import CatalystLLMProvider
 
 
 def get_llm_provider(model_name: str) -> BaseLLMProvider:
     """Factory to get the correct provider based on model name."""
     if model_name.startswith("gemini-"):
         return GoogleGeminiProvider()
-    else:
-        return OllamaProvider()
+    if model_name.startswith(("glm", "qwen")) or (
+        settings.CATALYST_LLM_ENDPOINT
+        and model_name == settings.CATALYST_LLM_MODEL
+    ):
+        return CatalystLLMProvider()
+    return OllamaProvider()
 
 
 async def get_prompt(db: AsyncIOMotorDatabase, prompt_type: str) -> dict | None:
@@ -98,6 +103,14 @@ async def process_expense_from_text(
     Parse a natural language expense description using LLM.
     Returns structured expense data or error.
     """
+    # LLM feature is disabled: short-circuit before touching any provider so
+    # the app runs without GCP/genai. Flip settings.LLM_ENABLED to re-enable.
+    if not settings.LLM_ENABLED:
+        return {
+            "message": "LLM feature is currently disabled",
+            "llmoutput": {},
+        }
+
     result, error = await generate_text_content(db, "chat", sentence)
 
     if error:
@@ -106,6 +119,11 @@ async def process_expense_from_text(
             "llmoutput": {},
         }
 
+    return _parse_llm_json(result)
+
+
+def _parse_llm_json(result: str) -> dict:
+    """Parse an LLM response as normalized expense JSON."""
     try:
         json_response = json.loads(result)
         # Normalize keys to lowercase
@@ -126,3 +144,69 @@ async def process_expense_from_text(
             "llmoutput": {},
             "raw": result,
         }
+
+
+# Fallback prompt when no "receipt" prompt is stored in db.prompts
+_DEFAULT_RECEIPT_PROMPT = """You are a receipt parser for an expense-splitting app.
+Look at the receipt image and respond with ONLY a JSON object (no markdown, no
+code fences, no commentary) with these keys:
+- "name": short merchant/expense title
+- "amount": grand total as a number
+- "currency": ISO 4217 code inferred from the receipt (e.g. "INR", "USD")
+- "date": receipt date as YYYY-MM-DD, or null if unreadable
+- "category": one of "Dining out", "Groceries", "Taxi", "Travel", "Shopping",
+  "Entertainment", "Utilities", "Health", "General"
+- "items": array of {"name": string, "amount": number} line items (may be [])
+If the image is not a receipt, respond with {"error": "not a receipt"}.
+"""
+
+
+async def process_expense_from_receipt(
+    db: AsyncIOMotorDatabase, image_base64: str, mime_type: str
+) -> dict:
+    """Parse a receipt image into structured expense data via the VL model."""
+    if not settings.LLM_ENABLED:
+        return {
+            "message": "LLM feature is currently disabled",
+            "llmoutput": {},
+        }
+
+    prompt_doc = await get_prompt(db, "receipt")
+    prompt_text = (
+        prompt_doc.get("prompt") if prompt_doc else None
+    ) or _DEFAULT_RECEIPT_PROMPT
+
+    provider = CatalystLLMProvider()
+    model = settings.CATALYST_VLM_MODEL
+
+    try:
+        result_text, stats = await provider.generate_vision_content(
+            model, prompt_text, image_base64, mime_type
+        )
+    except Exception as e:
+        traceback.print_exc()
+        return {
+            "message": f"Exception while calling vision LLM API: {e}",
+            "llmoutput": {},
+        }
+
+    result_text = (
+        result_text.replace("```", "").replace("json", "").replace("JSON", "").strip()
+    )
+
+    # Track usage the same way as the text path
+    await db.llm_stats.update_one(
+        {"model": model},
+        {
+            "$inc": {
+                "totalRequests": 1,
+                "promptTokens": stats["prompt_tokens"],
+                "completionTokens": stats["completion_tokens"],
+                "totalTokens": stats["total_tokens"],
+            },
+            "$set": {"lastUsedAt": datetime.now(timezone.utc)},
+        },
+        upsert=True,
+    )
+
+    return _parse_llm_json(result_text)

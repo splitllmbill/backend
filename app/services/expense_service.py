@@ -1,7 +1,19 @@
 from datetime import datetime, timezone
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from app.config import settings
+from app.services import fx_service
 from app.services.user_service import serialize_doc
+
+
+async def _resolve_base_currency(
+    db: AsyncIOMotorDatabase, user_id: str, event: dict | None
+) -> str:
+    """Context currency: the event's currency, else the creator's default."""
+    if event is not None:
+        return fx_service.normalize_currency(event.get("currency"))
+    creator = await db.users.find_one({"_id": ObjectId(user_id)}, {"defaultCurrency": 1})
+    return fx_service.normalize_currency((creator or {}).get("defaultCurrency"))
 
 
 async def create_expense(
@@ -28,35 +40,70 @@ async def create_expense(
             "success": "false",
         }
 
-    # Validate shares total
+    # Validate shares total (in the entered/transaction currency)
     share_total = sum(float(s.get("amount", 0)) for s in shares)
     if expense_type != "normal" and abs(share_total - amount) > 1:
         raise ValueError("Expense amount not equal to sum of shares")
 
-    # Convert userId strings to ObjectId in shares
+    now = datetime.now(timezone.utc)
+
+    # Parse expense date up-front — FX rates are date-sensitive
+    expense_date = request_data.get("date") or now
+    if isinstance(expense_date, str):
+        try:
+            expense_date = datetime.fromisoformat(expense_date.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            expense_date = now
+
+    # Resolve event first: it defines the base (context) currency
+    event = None
+    event_id = request_data.get("eventId")
+    if expense_type in ["group", "settle"] and event_id and event_id != "":
+        event = await db.event.find_one({"_id": ObjectId(event_id)})
+        if not event:
+            raise ValueError("Event not found for the provided eventId")
+
+    base_currency = await _resolve_base_currency(db, user_id, event)
+    currency = fx_service.normalize_currency(
+        request_data.get("currency") or base_currency
+    )
+    fx_rate = await fx_service.get_rate(currency, base_currency, on=expense_date, db=db)
+
+    # Amounts are stored converted to the base currency; the entered amounts
+    # are kept as originalAmount for display/editing.
     db_shares = []
     for share in shares:
+        share_amount = float(share["amount"])
         db_shares.append(
             {
                 "userId": ObjectId(share["userId"]),
-                "amount": float(share["amount"]),
+                "amount": round(share_amount * fx_rate, 2),
+                "originalAmount": share_amount,
                 "eventId": ObjectId(share["eventId"]) if share.get("eventId") else None,
             }
         )
 
     db_pay_shares = []
     for ps in pay_shares:
+        ps_amount = float(ps["amount"])
         db_pay_shares.append(
-            {"userId": ObjectId(ps["userId"]), "amount": float(ps["amount"])}
+            {
+                "userId": ObjectId(ps["userId"]),
+                "amount": round(ps_amount * fx_rate, 2),
+                "originalAmount": ps_amount,
+            }
         )
 
-    now = datetime.now(timezone.utc)
     new_expense = {
         "expenseName": expense_name,
-        "amount": float(amount),
+        "amount": round(float(amount) * fx_rate, 2),
+        "originalAmount": float(amount),
+        "currency": currency,
+        "baseCurrency": base_currency,
+        "fxRate": fx_rate,
         "type": expense_type,
         "category": category,
-        "date": request_data.get("date", now.isoformat()),
+        "date": expense_date,
         "shares": db_shares,
         "payShares": db_pay_shares,
         "createdBy": ObjectId(user_id),
@@ -65,29 +112,15 @@ async def create_expense(
         "updatedAt": now,
     }
 
-    # Parse date string if it's a string
-    if isinstance(new_expense["date"], str):
-        try:
-            new_expense["date"] = datetime.fromisoformat(
-                new_expense["date"].replace("Z", "+00:00")
-            )
-        except (ValueError, TypeError):
-            new_expense["date"] = now
-
-    event_id = request_data.get("eventId")
-    if expense_type in ["group", "settle"] and event_id and event_id != "":
-        event = await db.event.find_one({"_id": ObjectId(event_id)})
-        if event:
-            new_expense["eventId"] = ObjectId(event_id)
-            result = await db.expense.insert_one(new_expense)
-            new_expense["_id"] = result.inserted_id
-            # Add expense to event
-            await db.event.update_one(
-                {"_id": ObjectId(event_id)},
-                {"$push": {"expenses": result.inserted_id}},
-            )
-        else:
-            raise ValueError("Event not found for the provided eventId")
+    if event is not None:
+        new_expense["eventId"] = ObjectId(event_id)
+        result = await db.expense.insert_one(new_expense)
+        new_expense["_id"] = result.inserted_id
+        # Add expense to event
+        await db.event.update_one(
+            {"_id": ObjectId(event_id)},
+            {"$push": {"expenses": result.inserted_id}},
+        )
     else:
         result = await db.expense.insert_one(new_expense)
         new_expense["_id"] = result.inserted_id
@@ -107,7 +140,8 @@ async def get_expense_by_id(
     if not expense:
         return None
 
-    # Populate shares with user names
+    # Populate shares with user names. Amounts are surfaced in the transaction
+    # currency (originalAmount) so edit forms round-trip what was entered.
     new_shares = []
     for share in expense.get("shares", []):
         user = await db.users.find_one({"_id": share["userId"]})
@@ -116,7 +150,8 @@ async def get_expense_by_id(
                 "userId": str(share["userId"]),
                 "name": user["name"] if user else "Unknown",
                 "email": user["email"] if user else "",
-                "amount": float(share["amount"]),
+                "amount": float(share.get("originalAmount", share["amount"])),
+                "convertedAmount": float(share["amount"]),
             }
         )
 
@@ -128,7 +163,8 @@ async def get_expense_by_id(
                 "userId": str(ps["userId"]),
                 "name": user["name"] if user else "Unknown",
                 "email": user["email"] if user else "",
-                "amount": float(ps["amount"]),
+                "amount": float(ps.get("originalAmount", ps["amount"])),
+                "convertedAmount": float(ps["amount"]),
             }
         )
 
@@ -154,7 +190,11 @@ async def get_expense_by_id(
     return {
         "id": str(expense["_id"]),
         "expenseName": expense.get("expenseName", ""),
-        "amount": float(expense.get("amount", 0)),
+        "amount": float(expense.get("originalAmount", expense.get("amount", 0))),
+        "convertedAmount": float(expense.get("amount", 0)),
+        "currency": expense.get("currency", settings.DEFAULT_CURRENCY),
+        "baseCurrency": expense.get("baseCurrency", settings.DEFAULT_CURRENCY),
+        "fxRate": float(expense.get("fxRate", 1.0)),
         "type": expense.get("type", ""),
         "payShares": new_pay_shares,
         "shares": new_shares,
@@ -187,21 +227,44 @@ async def update_expense(
     if not expense:
         return {"message": "Expense not found", "success": "false"}
 
-    update_data = {
-        "expenseName": expense_name,
-        "amount": float(amount),
-        "category": category,
-        "updatedAt": datetime.now(timezone.utc),
-        "updatedBy": ObjectId(user_id),
-    }
+    # Re-resolve the FX conversion: the transaction currency may have changed,
+    # while the base (context) currency stays with the event/creator.
+    event = None
+    if expense.get("eventId"):
+        event = await db.event.find_one({"_id": expense["eventId"]})
+    base_currency = fx_service.normalize_currency(
+        expense.get("baseCurrency")
+        or (event or {}).get("currency")
+        or settings.DEFAULT_CURRENCY
+    )
+    currency = fx_service.normalize_currency(
+        request_data.get("currency") or expense.get("currency") or base_currency
+    )
 
+    date_val = expense.get("date")
     if "date" in request_data and request_data["date"]:
         date_val = request_data["date"]
         if isinstance(date_val, str):
             try:
                 date_val = datetime.fromisoformat(date_val.replace("Z", "+00:00"))
             except (ValueError, TypeError):
-                pass
+                date_val = expense.get("date")
+
+    fx_rate = await fx_service.get_rate(currency, base_currency, on=date_val, db=db)
+
+    update_data = {
+        "expenseName": expense_name,
+        "amount": round(float(amount) * fx_rate, 2),
+        "originalAmount": float(amount),
+        "currency": currency,
+        "baseCurrency": base_currency,
+        "fxRate": fx_rate,
+        "category": category,
+        "updatedAt": datetime.now(timezone.utc),
+        "updatedBy": ObjectId(user_id),
+    }
+
+    if "date" in request_data and request_data["date"]:
         update_data["date"] = date_val
 
     if "type" in request_data:
@@ -210,18 +273,25 @@ async def update_expense(
     if "payShares" in request_data:
         new_pay_shares = []
         for ps in request_data["payShares"]:
+            ps_amount = float(ps["amount"])
             new_pay_shares.append(
-                {"userId": ObjectId(ps["userId"]), "amount": float(ps["amount"])}
+                {
+                    "userId": ObjectId(ps["userId"]),
+                    "amount": round(ps_amount * fx_rate, 2),
+                    "originalAmount": ps_amount,
+                }
             )
         update_data["payShares"] = new_pay_shares
 
     if "shares" in request_data:
         new_shares = []
         for s in request_data["shares"]:
+            s_amount = float(s["amount"])
             new_shares.append(
                 {
                     "userId": ObjectId(s["userId"]),
-                    "amount": float(s["amount"]),
+                    "amount": round(s_amount * fx_rate, 2),
+                    "originalAmount": s_amount,
                     "eventId": ObjectId(s["eventId"]) if s.get("eventId") else None,
                 }
             )
@@ -282,6 +352,11 @@ async def get_event_expenses_with_summary(
                 "expenseDate": str(expense.get("date", "")),
                 "type": expense.get("type", ""),
                 "amount": float(expense.get("amount", 0)),
+                "currency": expense.get("baseCurrency", settings.DEFAULT_CURRENCY),
+                "originalAmount": float(
+                    expense.get("originalAmount", expense.get("amount", 0))
+                ),
+                "originalCurrency": expense.get("currency", settings.DEFAULT_CURRENCY),
                 "category": expense.get("category", ""),
                 "user_summary": summary,
             }
@@ -289,6 +364,7 @@ async def get_event_expenses_with_summary(
 
     return {
         "eventName": event.get("eventName", "") if event else "",
+        "currency": (event or {}).get("currency", settings.DEFAULT_CURRENCY),
         "expenses": expenses_with_summary,
     }
 

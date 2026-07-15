@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from app.config import settings
+from app.services import fx_service
 from app.services.user_service import serialize_doc, get_user_name_by_id
 
 
@@ -41,6 +43,7 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
                 "_id": "$_id",
                 "eventName": {"$first": "$eventName"},
                 "description": {"$first": "$description"},
+                "currency": {"$first": "$currency"},
                 "createdAt": {"$first": "$createdAt"},
                 "createdBy": {"$first": "$createdBy"},
                 "users": {"$first": "$users"},
@@ -66,17 +69,36 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
 
     user_name = user_map.get(str(user_id), {}).get("name", "You")
 
+    # Overall totals are shown in the viewer's default currency; per-event dues
+    # stay in the event's own currency.
+    viewer = await db.users.find_one(
+        {"_id": ObjectId(user_id)}, {"defaultCurrency": 1}
+    )
+    viewer_currency = fx_service.normalize_currency(
+        (viewer or {}).get("defaultCurrency")
+    )
+    event_currencies = {
+        fx_service.normalize_currency(e.get("currency")) for e in events
+    }
+    to_viewer_rates = await fx_service.get_rates_to(
+        viewer_currency, event_currencies, db=db
+    )
+
     for event in events:
+        event_currency = fx_service.normalize_currency(event.get("currency"))
+        event_rate = to_viewer_rates.get(event_currency, 1.0)
         event_dict = {
             "id": str(event["_id"]),
             "users": [str(u) for u in event.get("users", [])],
             "eventName": event.get("eventName", ""),
             "description": event.get("description", ""),
+            "currency": event_currency,
             "createdAt": str(event.get("createdAt", "")),
             "createdBy": str(event.get("createdBy", "")),
             "expenses": [str(exp["_id"]) for exp in event.get("expenses", [])],
             "dues": {
                 "userName": user_name,
+                "currency": event_currency,
                 "inDebtTo": [],
                 "isOwed": [],
                 "totalDebt": 0,
@@ -136,13 +158,13 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
                     {"id": str(due_id), "name": name, "amount": abs_amount}
                 )
                 event_dict["dues"]["totalOwed"] += abs_amount
-                overall_owe_amount += amount
+                overall_owe_amount += amount * event_rate
             else:
                 event_dict["dues"]["inDebtTo"].append(
                     {"id": str(due_id), "name": name, "amount": abs_amount}
                 )
                 event_dict["dues"]["totalDebt"] += abs_amount
-                overall_owe_amount += amount
+                overall_owe_amount += amount * event_rate
 
         events_list.append(event_dict)
 
@@ -151,8 +173,9 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
         overall_owe_amount = abs(overall_owe_amount)
 
     return {
-        "overallOweAmount": float(overall_owe_amount),
+        "overallOweAmount": round(float(overall_owe_amount), 2),
         "owingPerson": owing_person,
+        "currency": viewer_currency,
         "events": events_list,
     }
 
@@ -223,6 +246,20 @@ async def save_event(
             "updatedBy": ObjectId(user_id),
             "updatedAt": now,
         }
+
+        # Currency can only change while the event has no expenses — otherwise
+        # stored converted amounts would no longer match the event currency.
+        new_currency = request_data.get("currency")
+        if new_currency:
+            new_currency = fx_service.normalize_currency(new_currency)
+            current_currency = fx_service.normalize_currency(event.get("currency"))
+            if new_currency != current_currency:
+                if event.get("expenses"):
+                    raise ValueError(
+                        "Cannot change event currency after expenses are added"
+                    )
+                update_data["currency"] = new_currency
+
         await db.event.update_one({"_id": ObjectId(event_id)}, {"$set": update_data})
 
         # Auto-add friends
@@ -240,9 +277,19 @@ async def save_event(
         if creator_oid not in user_ids:
             user_ids.insert(0, creator_oid)
 
+        # Event currency: explicit choice, else the creator's default currency
+        currency = request_data.get("currency")
+        if not currency:
+            creator = await db.users.find_one(
+                {"_id": creator_oid}, {"defaultCurrency": 1}
+            )
+            currency = (creator or {}).get("defaultCurrency")
+        currency = fx_service.normalize_currency(currency)
+
         new_event = {
             "eventName": request_data.get("eventName", "Untitled Event"),
             "description": request_data.get("description", ""),
+            "currency": currency,
             "users": user_ids,
             "expenses": [],
             "createdBy": creator_oid,
@@ -421,7 +468,10 @@ async def get_event_dues(db: AsyncIOMotorDatabase, event_id: str) -> dict:
             {"id": debtor, "debtor": debtor_name, "creditorDetails": creditor_details}
         )
 
-    return {"eventDues": event_dues}
+    return {
+        "eventDues": event_dues,
+        "currency": event.get("currency", settings.DEFAULT_CURRENCY),
+    }
 
 
 async def get_event_dues_for_user(
@@ -430,6 +480,7 @@ async def get_event_dues_for_user(
     """Calculate who owes whom for a specific user within an event."""
     result = {
         "userName": "",
+        "currency": settings.DEFAULT_CURRENCY,
         "inDebtTo": [],
         "isOwed": [],
         "totalDebt": 0,
@@ -440,6 +491,9 @@ async def get_event_dues_for_user(
     result["userName"] = user_name
 
     event_dues_summary = await get_event_dues(db, event_id)
+    result["currency"] = event_dues_summary.get(
+        "currency", settings.DEFAULT_CURRENCY
+    )
 
     if event_dues_summary and "eventDues" in event_dues_summary:
         for person_in_debt in event_dues_summary["eventDues"]:

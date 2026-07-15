@@ -1,10 +1,13 @@
 from typing import Tuple, Dict, Any
-from google import genai
 from app.config import settings
 from .provider_base import BaseLLMProvider
 
 class GoogleGeminiProvider(BaseLLMProvider):
     def __init__(self):
+        # Imported lazily so the app boots/deploys without the google-genai
+        # package installed while the LLM feature is disabled. Re-add
+        # google-genai to requirements.txt to use this provider.
+        from google import genai
         self.client = genai.Client(
             vertexai=True,
             project=settings.GCP_PROJECT_ID,

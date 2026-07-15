@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_current_user
 from app.database import get_db
-from app.services import friend_service, user_service
+from bson import ObjectId
+from app.services import email_service, friend_service, user_service
 from app.models.schemas import FriendAddRequest, FriendDeleteRequest
 
 router = APIRouter()
@@ -80,5 +81,23 @@ async def settle_up_friend(
     if not user_id:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Snapshot dues before settling so the notification can carry the amount
+    dues_before = await friend_service.get_friend_dues(db, user_id, friend_id)
+
     result = await friend_service.settle_up_friend_dues(db, user_id, friend_id)
+
+    if result.get("success") == "true":
+        friend = await db.users.find_one(
+            {"_id": ObjectId(friend_id)}, {"email": 1, "name": 1}
+        )
+        if friend and friend.get("email"):
+            email_service.send_in_background(
+                email_service.send_settleup_email(
+                    to_email=friend["email"],
+                    to_name=friend.get("name", ""),
+                    payer_name=current_user.get("name", ""),
+                    amount=dues_before.get("oweAmount") or None,
+                    currency=dues_before.get("currency"),
+                )
+            )
     return result

@@ -2,6 +2,8 @@ from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 import datetime
 
+from app.services import fx_service
+
 
 def get_datetime_range(request_data: dict) -> list:
     """Parse date range from request data."""
@@ -36,7 +38,9 @@ def get_datetime_range(request_data: dict) -> list:
     return [start_dt, end_dt]
 
 
-async def group_owe_details(db: AsyncIOMotorDatabase, user_id: str) -> tuple:
+async def group_owe_details(
+    db: AsyncIOMotorDatabase, user_id: str, viewer_currency: str
+) -> tuple:
     """Calculate total owed and owing amounts for group/friend/settle expenses."""
     pipeline = [
         {
@@ -45,10 +49,13 @@ async def group_owe_details(db: AsyncIOMotorDatabase, user_id: str) -> tuple:
                 "shares.userId": ObjectId(user_id),
             }
         },
-        {"$project": {"payShares": 1, "shares": 1, "type": 1}},
+        {"$project": {"payShares": 1, "shares": 1, "type": 1, "baseCurrency": 1}},
     ]
 
     result = await db.expense.aggregate(pipeline).to_list(length=None)
+
+    bases = {fx_service.normalize_currency(e.get("baseCurrency")) for e in result}
+    rates = await fx_service.get_rates_to(viewer_currency, bases, db=db)
 
     total_owed_amount = 0  # others owe me
     total_owe_amount = 0  # I owe others
@@ -59,10 +66,13 @@ async def group_owe_details(db: AsyncIOMotorDatabase, user_id: str) -> tuple:
         total_paid = (
             sum(float(p["amount"]) for p in pay_shares) if pay_shares else 0
         )
+        rate = rates.get(
+            fx_service.normalize_currency(expense.get("baseCurrency")), 1.0
+        )
 
         for share in shares:
             participant_id = str(share["userId"])
-            share_amount = float(share["amount"])
+            share_amount = float(share["amount"]) * rate
 
             for ps in pay_shares:
                 payer_id = str(ps["userId"])
@@ -95,7 +105,10 @@ async def get_summary_for_homepage(
     date_range = get_datetime_range(request_data)
     total_share = 0
 
-    # Aggregate personal expenses where user paid
+    viewer_currency = fx_service.normalize_currency(user.get("defaultCurrency"))
+
+    # Aggregate personal expenses where user paid, per base currency, then
+    # convert each bucket into the viewer's currency.
     personal_pipeline = [
         {
             "$match": {
@@ -108,14 +121,22 @@ async def get_summary_for_homepage(
         {"$match": {"payShares.userId": ObjectId(user_id)}},
         {
             "$group": {
-                "_id": "$payShares.userId",
+                "_id": {"$ifNull": ["$baseCurrency", viewer_currency]},
                 "totalAmount": {"$sum": "$payShares.amount"},
             }
         },
     ]
 
     result = await db.expense.aggregate(personal_pipeline).to_list(length=None)
-    personal_expenses = float(result[0]["totalAmount"]) if result else 0.0
+    personal_bases = {fx_service.normalize_currency(r["_id"]) for r in result}
+    personal_rates = await fx_service.get_rates_to(
+        viewer_currency, personal_bases, db=db
+    )
+    personal_expenses = sum(
+        float(r["totalAmount"])
+        * personal_rates.get(fx_service.normalize_currency(r["_id"]), 1.0)
+        for r in result
+    )
 
     # Group/friend/settle expenses
     other_pipeline = [
@@ -126,22 +147,30 @@ async def get_summary_for_homepage(
                 "shares.userId": ObjectId(user_id),
             }
         },
-        {"$project": {"payShares": 1, "type": 1, "shares": 1}},
+        {"$project": {"payShares": 1, "type": 1, "shares": 1, "baseCurrency": 1}},
     ]
 
     result = await db.expense.aggregate(other_pipeline).to_list(length=None)
+    other_bases = {fx_service.normalize_currency(e.get("baseCurrency")) for e in result}
+    other_rates = await fx_service.get_rates_to(viewer_currency, other_bases, db=db)
     for expense in result:
+        rate = other_rates.get(
+            fx_service.normalize_currency(expense.get("baseCurrency")), 1.0
+        )
         for share in expense.get("shares", []):
             if str(share["userId"]) == user_id and expense.get("type") != "settle":
-                total_share += float(share["amount"])
+                total_share += float(share["amount"]) * rate
 
-    total_owe_amount, total_owed_amount = await group_owe_details(db, user_id)
+    total_owe_amount, total_owed_amount = await group_owe_details(
+        db, user_id, viewer_currency
+    )
 
     return {
-        "group_expenses": float(total_share),
-        "personal_expenses": personal_expenses,
+        "group_expenses": round(float(total_share), 2),
+        "personal_expenses": round(float(personal_expenses), 2),
         "total_you_owe": float(total_owe_amount),
         "total_owed_to_you": float(total_owed_amount),
+        "currency": viewer_currency,
         "username": user.get("name", ""),
     }
 
@@ -152,6 +181,15 @@ async def get_dashboard_chart(
     """Get category-wise expense breakdown for chart display."""
     date_range = get_datetime_range(request_data)
 
+    user = await db.users.find_one(
+        {"_id": ObjectId(user_id)}, {"defaultCurrency": 1}
+    )
+    viewer_currency = fx_service.normalize_currency(
+        (user or {}).get("defaultCurrency")
+    )
+
+    # Group per (category, base currency); currency conversion and percentage
+    # math happen in Python since rates live outside Mongo.
     pipeline = [
         {
             "$match": {
@@ -163,39 +201,39 @@ async def get_dashboard_chart(
         {"$match": {"payShares.userId": ObjectId(user_id)}},
         {
             "$group": {
-                "_id": None,
-                "totalCost": {"$sum": "$payShares.amount"},
-                "categoryData": {
-                    "$push": {
-                        "category": "$category",
-                        "cost": "$payShares.amount",
-                    }
+                "_id": {
+                    "category": "$category",
+                    "base": {"$ifNull": ["$baseCurrency", viewer_currency]},
                 },
-            }
-        },
-        {"$unwind": "$categoryData"},
-        {
-            "$group": {
-                "_id": "$categoryData.category",
-                "cost": {"$sum": "$categoryData.cost"},
+                "cost": {"$sum": "$payShares.amount"},
                 "noOfTransactions": {"$sum": 1},
-                "totalCost": {"$first": "$totalCost"},
             }
         },
-        {
-            "$project": {
-                "category": "$_id",
-                "cost": 1,
-                "noOfTransactions": 1,
-                "percent": {
-                    "$multiply": [{"$divide": ["$cost", "$totalCost"]}, 100]
-                },
-            }
-        },
-        {"$sort": {"cost": -1}},
     ]
 
-    result = await db.expense.aggregate(pipeline).to_list(length=None)
-    return [
-        {k: v for k, v in entry.items() if k != "_id"} for entry in result
-    ]
+    rows = await db.expense.aggregate(pipeline).to_list(length=None)
+    bases = {fx_service.normalize_currency(r["_id"]["base"]) for r in rows}
+    rates = await fx_service.get_rates_to(viewer_currency, bases, db=db)
+
+    by_category: dict[str, dict] = {}
+    total_cost = 0.0
+    for row in rows:
+        category = row["_id"]["category"]
+        rate = rates.get(fx_service.normalize_currency(row["_id"]["base"]), 1.0)
+        cost = float(row["cost"]) * rate
+        entry = by_category.setdefault(
+            category, {"category": category, "cost": 0.0, "noOfTransactions": 0}
+        )
+        entry["cost"] += cost
+        entry["noOfTransactions"] += int(row["noOfTransactions"])
+        total_cost += cost
+
+    result = []
+    for entry in sorted(by_category.values(), key=lambda e: -e["cost"]):
+        entry["cost"] = round(entry["cost"], 2)
+        entry["percent"] = (
+            round(entry["cost"] / total_cost * 100, 2) if total_cost else 0.0
+        )
+        entry["currency"] = viewer_currency
+        result.append(entry)
+    return result

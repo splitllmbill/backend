@@ -44,6 +44,18 @@ async def update_account(
         raise HTTPException(status_code=500, detail="Failed to update account details")
     return {"message": "Account updated successfully"}
 
+@router.delete("/user/account")
+async def delete_account(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Permanently delete the current user's account (store-required flow)."""
+    deleted = await user_service.delete_user_account(db, current_user["uid"])
+    if not deleted:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "Account deleted"}
+
+
 @router.get("/user/invites")
 async def get_invites(
     current_user: dict = Depends(get_current_user),

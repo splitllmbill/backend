@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     # Supabase (for asymmetric JWT validation)
     SUPABASE_URL: str = "https://your-project.supabase.co"
     SUPABASE_ANON_KEY: str = "your-anon-key"
+    # Service-role key (secret!) — only needed so account deletion can also
+    # remove the Supabase auth record. Leave empty to skip that step.
+    SUPABASE_SERVICE_ROLE_KEY: str = ""
 
     # LLM feature is disabled by default so the app can deploy and run before the
     # QuickML endpoints are wired up. Set LLM_ENABLED=true once the Catalyst

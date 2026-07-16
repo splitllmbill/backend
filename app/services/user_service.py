@@ -202,13 +202,15 @@ async def create_phantom_user(
 
 async def link_phantom_expenses(db: AsyncIOMotorDatabase, email: str, user_id_str: str):
     """Link expenses where the user was invited by email before registration."""
-    # We update shares where email matches, setting the userId
-    await db.expenses.update_many(
+    # We update shares where email matches, setting the userId.
+    # NB: the expense collection is `db.expense` (singular) — this previously
+    # targeted a nonexistent `db.expenses`, silently linking nothing.
+    await db.expense.update_many(
         {"shares.email": email},
         {"$set": {"shares.$[elem].userId": user_id_str}},
         array_filters=[{"elem.email": email}]
     )
-    await db.expenses.update_many(
+    await db.expense.update_many(
         {"payShares.email": email},
         {"$set": {"payShares.$[elem].userId": user_id_str}},
         array_filters=[{"elem.email": email}]
@@ -311,3 +313,80 @@ async def get_invited_users(db: AsyncIOMotorDatabase, friend_code: str) -> list[
     cursor = db.users.find({"invitedBy": friend_code})
     users = await cursor.to_list(length=100)
     return [serialize_doc(u) for u in users]
+
+
+async def _delete_supabase_auth_user(uid: str) -> None:
+    """Best-effort removal of the Supabase auth record.
+
+    Needs SUPABASE_SERVICE_ROLE_KEY; without it (or on error) the Mongo-side
+    deletion still stands — the orphaned auth record can no longer reach any
+    data because the tombstoned user fails every lookup.
+    """
+    import httpx
+
+    key = settings.SUPABASE_SERVICE_ROLE_KEY
+    if not key or uid.startswith(("phantom_", "deleted_")):
+        return
+    url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{uid}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.delete(
+                url, headers={"apikey": key, "Authorization": f"Bearer {key}"}
+            )
+            if resp.status_code not in (200, 204, 404):
+                print(
+                    "WARNING: Supabase auth deletion returned "
+                    f"{resp.status_code} for {uid}"
+                )
+    except Exception as e:
+        print(f"WARNING: Supabase auth deletion failed for {uid}: {e}")
+
+
+async def delete_user_account(db: AsyncIOMotorDatabase, uid: str) -> bool:
+    """Permanently delete the user's account and personal data.
+
+    Store-required deletion flow (App Store 5.1.1(v) / Play policy). Data
+    owned solely by the user is removed; records shared with other people are
+    kept for their balances' integrity but point at an anonymous tombstone
+    ("Deleted User") with every personal field erased.
+    """
+    import uuid as _uuid
+
+    user = await db.users.find_one({"firebaseUid": uid})
+    if not user:
+        return False
+    oid = user["_id"]
+
+    # Solo data: personal expenses and public settle-up pages.
+    await db.expense.delete_many({"type": "normal", "createdBy": oid})
+    await db.payment_page.delete_many({"userId": oid})
+
+    # Drop the user from everyone's friends list.
+    await db.users.update_many({"friends": oid}, {"$pull": {"friends": oid}})
+
+    # Anonymous tombstone: shared expenses keep resolving to "Deleted User".
+    # friendCode is unset so it can never be used as an invite again (the
+    # unique index is sparse), and the random firebaseUid can never collide
+    # with a real auth subject.
+    now = datetime.now(timezone.utc)
+    await db.users.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "firebaseUid": f"deleted_{_uuid.uuid4().hex}",
+                "email": "",
+                "name": "Deleted User",
+                "upiId": "",
+                "password": "",
+                "friends": [],
+                "role": "user",
+                "isDeleted": True,
+                "deletedAt": now,
+                "updatedAt": now,
+            },
+            "$unset": {"friendCode": ""},
+        },
+    )
+
+    await _delete_supabase_auth_user(uid)
+    return True

@@ -7,6 +7,7 @@
         "DB_NAME": "splitllm",
         "SUPABASE_URL": "https://jolggtuiatbxrjomfbxl.supabase.co",
         "SUPABASE_ANON_KEY": "sb_publishable_Y-dpGB63ipwupP3Y3-6HAw_6d6w3wpO",
+        "SUPABASE_SERVICE_ROLE_KEY": "SET_ME_supabase_service_role_key",
         "CORS_ORIGINS": "https://splitllm.com,https://www.splitllm.com,https://splitllm-60078340202.development.catalystserverless.in",
         "DEFAULT_CURRENCY": "INR",
         "FX_API_URL": "",

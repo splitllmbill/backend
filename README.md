@@ -1,13 +1,13 @@
 # SplitLLM Backend
 
-Async FastAPI backend for the SplitLLM expense-splitting app with Supabase JWT authentication, MongoDB, and Google Vertex AI (Gemini) for natural language expense parsing.
+Async FastAPI backend for the SplitLLM expense-splitting app with Supabase JWT authentication, MongoDB, and Catalyst QuickML (GLM/Qwen) for natural-language expense parsing and receipt scanning. Deployed on Zoho Catalyst AppSail.
 
 ## Tech Stack
 
 - **Python 3.12+** with **FastAPI**
 - **Motor** (async MongoDB driver)
 - **Supabase JWT** verification (asymmetric, via the project's public JWKS)
-- **Google Vertex AI** (`google-genai` with Vertex AI backend) for LLM inference
+- **Catalyst QuickML LLM Serving** (GLM text + Qwen vision-language) for LLM inference
 - **Pydantic v2** for request/response validation
 
 ## Quick Start
@@ -17,8 +17,8 @@ Async FastAPI backend for the SplitLLM expense-splitting app with Supabase JWT a
 - Python 3.12+
 - MongoDB (local via Docker, or Atlas for production)
 - A Supabase project (for auth)
-- A GCP project with Vertex AI API enabled
-- `gcloud` CLI for local auth (`gcloud auth application-default login`)
+- (Optional, for LLM/receipt features) Catalyst QuickML endpoints + a Zoho Self
+  Client — the app runs fine with `LLM_ENABLED=false`
 
 ### 2. Setup
 
@@ -34,16 +34,16 @@ pip install -r requirements-dev.txt   # or `-r requirements.txt` for runtime onl
 
 # Configure environment
 cp .env.example .env
-# Edit .env with your credentials (MONGODB_URI, SUPABASE_*, GCP_PROJECT_ID, etc.)
+# Edit .env with your credentials (MONGODB_URI, SUPABASE_*, QUICKML_*, etc.)
 ```
 
 **Authentication:**
 - **Supabase:** Stateless JWT validation — the API verifies the Supabase access token
   (Bearer JWT) against `${SUPABASE_URL}/auth/v1/.well-known/jwks.json` and reads the
   user id from the `sub` claim.
-- **Vertex AI:** Uses Application Default Credentials (ADC). Locally, run
-  `gcloud auth application-default login`. On Cloud Run, the service account provides
-  credentials automatically — just grant it the `roles/aiplatform.user` IAM role.
+- **QuickML (optional):** The LLM and receipt-scanning features call Catalyst
+  QuickML endpoints, authenticated with a Zoho OAuth token (Self Client refresh
+  flow). Left disabled (`LLM_ENABLED=false`) they are skipped entirely.
 
 ### 3. Run
 
@@ -65,37 +65,11 @@ The `docker-compose.yml` runs a local MongoDB 7.0 container with a named volume
 (`mongo_data`) for data persistence. Data survives `docker-compose down` but is
 only stored locally — use MongoDB Atlas for production.
 
-## Deploy to Google Cloud Run
+**Database (production):** Create a free **MongoDB Atlas M0** cluster, add a
+database user, and (for the M0 free tier) allow access from `0.0.0.0/0` (auth is
+via the connection string). Use the SRV connection string as `MONGODB_URI`.
 
-The API ships as a container ([`Dockerfile`](./Dockerfile)) that listens on `$PORT`
-(Cloud Run injects `8080`). Connect your repository to Cloud Run for automatic
-deployment on every commit.
-
-**Database:** Create a free **MongoDB Atlas M0** cluster, add a database user, and
-(for the M0 free tier) allow access from `0.0.0.0/0` (auth is via the connection
-string). Use the SRV connection string as `MONGODB_URI`.
-
-**Vertex AI:** The Cloud Run service account needs the `roles/aiplatform.user` IAM
-role. No API key is required — authentication is handled via ADC.
-
-**Required Cloud Run Environment Variables:**
-
-| Variable | Type | Description |
-|---|---|---|
-| `MONGODB_URI` | Secret | MongoDB Atlas SRV connection string |
-| `GCP_PROJECT_ID` | Env var | GCP project ID for Vertex AI |
-| `GCP_LOCATION` | Env var | Vertex AI region (e.g. `global`) |
-| `GEMINI_MODEL` | Env var | Model name (default: `gemini-2.0-flash`) |
-| `DB_NAME` | Env var | Database name (default: `splitllm`) |
-| `SUPABASE_URL` | Env var | Supabase project URL |
-| `SUPABASE_ANON_KEY` | Env var | Supabase publishable / anon key |
-| `CORS_ORIGINS` | Env var | Comma-separated allowed origins |
-
-> **Service-to-service:** Another backend can call this API at its public URL. To make
-> a call privately/without exposing it, grant that service's account the
-> `roles/run.invoker` role and send a Google-signed ID token — Cloud Run handles the
-> IAM check. (Keep `--allow-unauthenticated` while the browser frontend needs direct
-> access.)
+> The production deploy path is **Zoho Catalyst AppSail** — see the section below.
 
 ## API Documentation
 
@@ -144,15 +118,17 @@ Once running, visit:
 | `DB_NAME` | Database name | `splitllm` |
 | `SUPABASE_URL` | Supabase project URL (used to fetch the JWKS) | `https://your-project.supabase.co` |
 | `SUPABASE_ANON_KEY` | Supabase publishable / anon key | (set per environment) |
-| `GCP_PROJECT_ID` | GCP project ID for Vertex AI | (required for LLM) |
-| `GCP_LOCATION` | Vertex AI region | `global` |
-| `GEMINI_MODEL` | Gemini model name | `gemini-2.0-flash` |
-| `CORS_ORIGINS` | Comma-separated allowed origins (add your Vercel URL) | `http://localhost:3000,...` |
+| `LLM_ENABLED` | Enable Catalyst QuickML LLM/receipt features | `false` |
+| `QUICKML_LLM_ENDPOINT` | QuickML GLM text endpoint (required when LLM enabled) | (empty) |
+| `QUICKML_VLM_ENDPOINT` | QuickML Qwen vision endpoint (receipts) | (empty) |
+| `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` / `OAUTH_REFRESH_TOKEN` | Zoho Self Client for QuickML auth | (empty) |
+| `CORS_ORIGINS` | Comma-separated allowed origins (add the hosting domain) | `http://localhost:3000,...` |
 | `HOST` | Server host (local only) | `0.0.0.0` |
-| `PORT` | Server port (Cloud Run injects `8080`) | `8081` |
+| `PORT` | Server port (AppSail injects its own listen port) | `8081` |
 
-> On Cloud Run, `MONGODB_URI` should be provided via **Secret Manager**;
-> the rest are plain env vars. Locally they all come from `.env`.
+> In production these live in `catalyst/appsail/app-config.json` `env_variables`
+> and the Catalyst console (secrets never enter the bundle or repo). Locally they
+> all come from `.env`. See `.env.example` for the full list.
 
 ## Deployment (Zoho Catalyst AppSail)
 

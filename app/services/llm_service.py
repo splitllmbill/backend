@@ -4,21 +4,14 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.config import settings
 from datetime import datetime, timezone
 from .llm.provider_base import BaseLLMProvider
-from .llm.google_provider import GoogleGeminiProvider
-from .llm.ollama_provider import OllamaProvider
 from .llm.catalyst_provider import CatalystLLMProvider
 
 
 def get_llm_provider(model_name: str) -> BaseLLMProvider:
-    """Factory to get the correct provider based on model name."""
-    if model_name.startswith("gemini-"):
-        return GoogleGeminiProvider()
-    if model_name.startswith(("glm", "qwen")) or (
-        settings.CATALYST_LLM_ENDPOINT
-        and model_name == settings.CATALYST_LLM_MODEL
-    ):
-        return CatalystLLMProvider()
-    return OllamaProvider()
+    """Return the LLM provider. Catalyst QuickML (GLM text / Qwen vision) is the
+    only backend now; the active model name is forwarded to the provider at call
+    time so it can pick the right endpoint."""
+    return CatalystLLMProvider()
 
 
 async def get_prompt(db: AsyncIOMotorDatabase, prompt_type: str) -> dict | None:
@@ -49,7 +42,7 @@ async def generate_text_content(
     try:
         # Fetch active model from DB
         settings_doc = await db.settings.find_one({"_id": "llm_settings"})
-        active_model = settings_doc.get("activeModel", settings.GEMINI_MODEL) if settings_doc else settings.GEMINI_MODEL
+        active_model = settings_doc.get("activeModel", settings.CATALYST_LLM_MODEL) if settings_doc else settings.CATALYST_LLM_MODEL
 
         provider = get_llm_provider(active_model)
         result_text, stats = await provider.generate_content(active_model, full_prompt)

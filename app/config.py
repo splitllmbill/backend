@@ -14,14 +14,10 @@ class Settings(BaseSettings):
     SUPABASE_URL: str = "https://your-project.supabase.co"
     SUPABASE_ANON_KEY: str = "your-anon-key"
 
-    # Google Vertex AI (Gemini)
-    # LLM feature is disabled by default so the app can deploy without GCP
-    # credentials or the google-genai dependency. Set LLM_ENABLED=true (and add
-    # google-genai back to requirements.txt) to turn it back on.
+    # LLM feature is disabled by default so the app can deploy and run before the
+    # QuickML endpoints are wired up. Set LLM_ENABLED=true once the Catalyst
+    # QuickML endpoints below are configured.
     LLM_ENABLED: bool = False
-    GCP_PROJECT_ID: str = ""
-    GCP_LOCATION: str = "global"
-    GEMINI_MODEL: str = "gemini-2.0-flash"
 
     # Catalyst QuickML LLM Serving (GLM text model + Qwen vision-language)
     # Endpoints come from the QuickML console (LLM Serving tab -> Model Details).

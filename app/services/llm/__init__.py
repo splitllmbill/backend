@@ -1,1 +1,1 @@
-"""LLM provider implementations (Google Gemini, Ollama) behind a common base."""
+"""LLM provider implementations (Catalyst QuickML) behind a common base."""

@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# - PYTHONUNBUFFERED: stream logs straight to stdout (Cloud Run log capture)
+# - PYTHONUNBUFFERED: stream logs straight to stdout (container log capture)
 # - PYTHONDONTWRITEBYTECODE: no .pyc files in the image
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -19,7 +19,8 @@ COPY app ./app
 RUN useradd --create-home --uid 1000 appuser
 USER appuser
 
-# Cloud Run (and most PaaS) inject $PORT; default to 8080 for plain `docker run`.
+# Honour an injected $PORT if the host sets one; default to 8080 for a plain
+# `docker run` (docker-compose overrides this to 8081 for local dev).
 ENV PORT=8080
 EXPOSE 8080
 

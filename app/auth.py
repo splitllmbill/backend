@@ -17,14 +17,14 @@ jwks_client = PyJWKClient(
     cache_keys=True
 )
 
-async def get_current_user(
+async def get_verified_identity(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> dict:
     """
-    FastAPI dependency that verifies a Supabase JWT token using asymmetric JWKS.
-    Also ensures the user exists in the local MongoDB.
-    Returns a dict with 'uid' and 'email'.
+    Verify a Supabase JWT (asymmetric JWKS) and return its identity WITHOUT
+    touching MongoDB. Signup/login depend on this: get_current_user would try
+    to auto-create the user before the route can supply the invite code, which
+    rejected every new (non-first) user with "Invite code is required".
     """
     token = credentials.credentials
     try:
@@ -35,12 +35,12 @@ async def get_current_user(
             algorithms=["RS256", "ES256", "HS256"],
             audience="authenticated"
         )
-        
+
         uid = decoded_token.get("sub")
         email = decoded_token.get("email", "")
         user_metadata = decoded_token.get("user_metadata", {})
         name = user_metadata.get("full_name", user_metadata.get("name", ""))
-        
+
         if not uid:
             raise HTTPException(status_code=401, detail="Invalid token: missing subject (sub)")
 
@@ -53,13 +53,29 @@ async def get_current_user(
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
 
+    return {"uid": uid, "email": email, "name": name}
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> dict:
+    """
+    FastAPI dependency that verifies a Supabase JWT token using asymmetric JWKS.
+    Also ensures the user exists in the local MongoDB.
+    Returns a dict with 'uid' and 'email'.
+    """
+    identity = await get_verified_identity(credentials)
+
     # Sync user to MongoDB
-    user = await user_service.find_or_create_user(db, uid=uid, email=email, name=name)
+    user = await user_service.find_or_create_user(
+        db, uid=identity["uid"], email=identity["email"], name=identity["name"]
+    )
 
     return {
-        "uid": uid,
-        "email": email,
-        "name": name,
+        "uid": identity["uid"],
+        "email": identity["email"],
+        "name": identity["name"],
         "role": user.get("role", "user")
     }
 

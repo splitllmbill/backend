@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from app.auth import get_current_user
+from app.auth import get_current_user, get_verified_identity
 from app.database import get_db
 from app.services import user_service
 from app.models.schemas import LoginRequest, SignupRequest, ChangePasswordRequest
@@ -8,18 +8,21 @@ from app.models.schemas import LoginRequest, SignupRequest, ChangePasswordReques
 router = APIRouter()
 
 
+# /login and /signup use the verify-only dependency: get_current_user would
+# auto-create the Mongo user before these handlers run, without the invite
+# code from the request body — rejecting every new (non-first) user.
 @router.post("/login")
 async def login(
     request: LoginRequest,
-    current_user: dict = Depends(get_current_user),
+    identity: dict = Depends(get_verified_identity),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Called after Firebase sign-in. Creates user if not exists."""
     user = await user_service.find_or_create_user(
         db,
-        uid=current_user["uid"],
-        email=current_user["email"] or request.email,
-        name=current_user.get("name", ""),
+        uid=identity["uid"],
+        email=identity["email"] or request.email,
+        name=identity.get("name", ""),
         password=request.password,
     )
     return user
@@ -28,14 +31,14 @@ async def login(
 @router.post("/signup")
 async def signup(
     request: SignupRequest,
-    current_user: dict = Depends(get_current_user),
+    identity: dict = Depends(get_verified_identity),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Called after Firebase sign-up. Creates user record."""
     user = await user_service.find_or_create_user(
         db,
-        uid=current_user["uid"],
-        email=current_user["email"] or request.email,
+        uid=identity["uid"],
+        email=identity["email"] or request.email,
         name=request.name,
         password=request.password,
         invite_code=request.inviteCode,

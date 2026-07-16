@@ -4,7 +4,9 @@ from app.database import get_db
 from conftest import MOCK_USER_UID
 
 
-@pytest.mark.asyncio
+# loop_scope="session": these tests await the Motor client directly, and it
+# is bound to the session-scoped loop from conftest's setup fixture.
+@pytest.mark.asyncio(loop_scope="session")
 async def test_link_phantom_expenses_targets_expense_collection():
     """Regression: linking previously wrote to a nonexistent `expenses`."""
     from app.services.user_service import link_phantom_expenses
@@ -26,7 +28,7 @@ async def test_link_phantom_expenses_targets_expense_collection():
     await db.expense.delete_one({"_id": inserted.inserted_id})
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="session")
 async def test_delete_account_tombstones_user_and_removes_personal_data(client):
     db = get_db()
     user = await db.users.find_one({"firebaseUid": MOCK_USER_UID})

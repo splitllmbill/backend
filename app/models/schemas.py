@@ -90,9 +90,29 @@ class EventUpdate(BaseModel):
     description: str = ""
     members: list[str] = Field(default_factory=list, alias="users")
     currency: Optional[str] = None
+    # Only meaningful when the currency changes on a group that already has
+    # expenses: True re-converts them all, False leaves them as recorded.
+    # Omitted (None) makes the API ask rather than guess.
+    applyToExpenses: Optional[bool] = None
 
     class Config:
         populate_by_name = True
+
+
+class MemberRatesRequest(BaseModel):
+    """A member's own conversion rates into the group currency.
+
+    Rates replace that member's previous overrides wholesale; a currency left
+    out falls back to the market rate.
+    """
+
+    rates: dict[str, float] = Field(default_factory=dict)
+
+
+class JoinEventRequest(BaseModel):
+    # Take over an existing (placeholder) member's spot instead of joining as
+    # a new person, so their history becomes yours.
+    claimMemberId: Optional[str] = None
 
 
 # ─── Shares ─────────────────────────────────────────────────────────────

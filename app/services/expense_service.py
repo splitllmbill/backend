@@ -7,6 +7,14 @@ from app.services import fx_service
 from app.services.user_service import serialize_doc
 
 
+def _entry_amount(entry: dict) -> float:
+    """A share/payShare amount in the currency the expense was entered in."""
+    value = entry.get("originalAmount")
+    if value is None:
+        value = entry.get("amount", 0)
+    return float(value or 0)
+
+
 async def user_can_access_expense(
     db: AsyncIOMotorDatabase, expense: dict, user_id: str
 ) -> bool:
@@ -151,6 +159,11 @@ async def create_expense(
         "createdAt": now,
         "updatedAt": now,
     }
+
+    # Fingerprint of the source row when this came from an import, so importing
+    # the same export again only brings in what is new.
+    if request_data.get("importKey"):
+        new_expense["importKey"] = str(request_data["importKey"])
 
     if event is not None:
         new_expense["eventId"] = ObjectId(event_id)
@@ -394,12 +407,32 @@ async def get_event_expenses(db: AsyncIOMotorDatabase, event_id: str) -> list:
 async def get_event_expenses_with_summary(
     db: AsyncIOMotorDatabase, user_id: str, event_id: str
 ) -> dict:
-    """Get event expenses with per-user summary (who owes whom per expense)."""
+    """Get event expenses with per-user summary (who owes whom per expense).
+
+    Each row carries the amount in the currency it was actually paid in *and*
+    the same amount converted into the group currency at the viewer's own
+    rates, so the list can be shown either way without a second round trip.
+    """
+    from app.services import event_service
+
     expenses = await get_event_expenses(db, event_id)
     event = await db.event.find_one({"_id": ObjectId(event_id)})
+    base_currency = fx_service.normalize_currency((event or {}).get("currency"))
+    currencies = {
+        fx_service.normalize_currency(e.get("currency")) for e in expenses
+    }
+    rates = await event_service.get_member_rates(
+        db, event or {}, user_id, currencies
+    )
 
     expenses_with_summary = []
     for expense in expenses:
+        original_currency = fx_service.normalize_currency(expense.get("currency"))
+        rate = rates.get(original_currency, 1.0)
+        original_amount = expense.get("originalAmount")
+        if original_amount is None:
+            original_amount = expense.get("amount", 0)
+        original_amount = float(original_amount or 0)
         summary = _get_expense_share_summary(expense, user_id)
         expenses_with_summary.append(
             {
@@ -407,41 +440,52 @@ async def get_event_expenses_with_summary(
                 "expenseId": str(expense["_id"]),
                 "expenseDate": str(expense.get("date", "")),
                 "type": expense.get("type", ""),
-                "amount": float(expense.get("amount", 0)),
-                "currency": expense.get("baseCurrency", settings.DEFAULT_CURRENCY),
-                "originalAmount": float(
-                    expense.get("originalAmount", expense.get("amount", 0))
-                ),
-                "originalCurrency": expense.get("currency", settings.DEFAULT_CURRENCY),
+                # `amount`/`currency` stay in the group currency for callers
+                # that only care about one number.
+                "amount": round(original_amount * rate, 2),
+                "currency": base_currency,
+                "originalAmount": original_amount,
+                "originalCurrency": original_currency,
+                "rate": rate,
                 "category": expense.get("category", ""),
-                "user_summary": summary,
+                "user_summary": {
+                    **summary,
+                    "oweAmountConverted": round(summary["oweAmount"] * rate, 2),
+                    "oweCurrency": original_currency,
+                },
             }
         )
 
     return {
         "eventName": event.get("eventName", "") if event else "",
-        "currency": (event or {}).get("currency", settings.DEFAULT_CURRENCY),
+        "currency": base_currency,
+        "currencies": sorted(currencies),
+        "rates": rates,
         "expenses": expenses_with_summary,
     }
 
 
 def _get_expense_share_summary(expense: dict, user_id: str) -> dict:
-    """Calculate the owe summary for a user on a single expense."""
-    user_owe = 0
-    friends_owe = 0
+    """Calculate the owe summary for a user on a single expense.
+
+    Amounts are in the expense's own currency — converting is the caller's job,
+    since only it knows whose rates to use.
+    """
+    user_owe = 0.0
+    friends_owe = 0.0
     pay_share_user_ids = [str(ps["userId"]) for ps in expense.get("payShares", [])]
 
     if user_id in pay_share_user_ids:
         for share in expense.get("shares", []):
             if str(share["userId"]) != user_id:
-                friends_owe += float(share["amount"])
+                friends_owe += _entry_amount(share)
     else:
         for share in expense.get("shares", []):
             if str(share["userId"]) == user_id:
-                user_owe += float(share["amount"])
+                user_owe += _entry_amount(share)
 
     return {
-        "oweAmount": float(abs(user_owe - friends_owe)),
+        "oweAmount": round(abs(user_owe - friends_owe), 2),
         "owePerson": "user" if user_owe > friends_owe else "friend",
     }
 

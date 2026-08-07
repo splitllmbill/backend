@@ -96,6 +96,16 @@ Once running, visit:
 | Events | DELETE | `/db/event/:id` | ✅ |
 | Events | GET | `/db/event/:id/expenses` | ✅ |
 | Events | GET | `/db/user/event/:id/dues` | ✅ |
+| Events | GET | `/db/event/:id/dues` | ✅ |
+| Events | GET | `/db/event/:id/summary` | ✅ |
+| Events | GET | `/db/event/:id/currency-impact` | ✅ |
+| Events | GET/PUT | `/db/event/:id/rates` | ✅ |
+| Events | GET | `/db/event/:id/join-link` | ✅ |
+| Events | POST | `/db/event/:id/join-link/rotate` | ✅ |
+| Events | GET/POST | `/db/event/join/:code` | ✅ |
+| Auth | GET | `/db/invite/validate` | ❌ |
+| Import | POST | `/db/import/splitwise/preview` | ✅ |
+| Import | POST | `/db/import/splitwise` | ✅ |
 | Expenses | POST | `/db/expense` | ✅ |
 | Expenses | GET | `/db/expense/:id` | ✅ |
 | Expenses | PUT | `/db/expense/:id` | ✅ |
@@ -109,6 +119,46 @@ Once running, visit:
 | Friends | GET | `/db/user/expense/friend/:id` | ✅ |
 | Friends | POST | `/db/user/expense/friend/:id/settleup` | ✅ |
 | Payments | GET | `/db/payment/:link` | ❌ |
+
+## Multi-currency groups
+
+Every expense keeps the currency it was actually paid in (`currency` +
+`originalAmount`) alongside a conversion into the group currency
+(`baseCurrency` + `amount`). Balances are accumulated **per currency** and only
+collapsed into one number for display, because that last step needs a rate and
+members legitimately disagree about it:
+
+* `event.memberRates[userId]` holds one member's own rates into the group
+  currency (`PUT /db/event/:id/rates`). Anything not overridden uses the market
+  rate from `fx_service`.
+* Dues and totals therefore come back both ways — `amount`/`total` converted at
+  the caller's rates, and `byCurrency` maps left exactly as recorded.
+* Changing a group's currency is refused with **409
+  `currency_change_requires_choice`** while it has expenses. Re-send with
+  `applyToExpenses: true` to re-convert every transaction (at each expense's own
+  date), or `false` to leave them as recorded.
+
+## Joining a group
+
+`GET /db/event/:id/join-link` returns a shareable URL. Opening it shows the
+group and its unclaimed "phantom" members — people added by email or created by
+an import who have never signed in. `POST /db/event/join/:code` either adds the
+caller as a new member or, with `claimMemberId`, merges that placeholder into
+their account so its expenses and balances follow them.
+
+A join code also works as a signup invite (`inviteCode` on `/db/signup`), which
+is what makes a group link usable by someone with no account yet.
+`GET /db/invite/validate?code=` checks either kind of code without auth — Google
+sign-in has to validate before the OAuth redirect, when there is no session.
+
+## Importing
+
+`POST /db/import/splitwise` creates a group from a Splitwise export. Passing
+`eventId` instead of `eventName` imports into an existing group and adds **only
+the rows that are not already there** — each expense stores an `importKey`
+fingerprint of its source row, so re-exporting after a trip tops the group up
+rather than duplicating it. The preview endpoint reports `newRowCount` /
+`duplicateRowCount` up front.
 
 ## Environment Variables
 

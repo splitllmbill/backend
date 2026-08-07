@@ -18,9 +18,12 @@ are settlements (type="settle").
 """
 
 import csv
+import hashlib
 import io
 import logging
 from datetime import datetime, timezone
+
+from bson import ObjectId
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -91,7 +94,101 @@ def parse_splitwise_csv(content: str) -> dict:
     return {"members": members, "rows": parsed_rows}
 
 
-def build_preview(filename: str, parsed: dict) -> dict:
+def row_import_key(row: dict) -> str:
+    """Stable fingerprint of a Splitwise row.
+
+    Re-exporting a group produces byte-identical rows for expenses that already
+    came across, so hashing the row is enough to import only the delta. The
+    member nets are part of the key: editing an expense in Splitwise changes
+    them, and that genuinely is a different transaction to us.
+    """
+    nets = ",".join(
+        f"{member}:{row['nets'].get(member, 0.0):.2f}"
+        for member in sorted(row.get("nets", {}))
+    )
+    payload = "|".join(
+        [
+            (row.get("date") or "")[:10],
+            row.get("description", ""),
+            f"{float(row.get('cost', 0)):.2f}",
+            row.get("currency", ""),
+            nets,
+        ]
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _loose_key(date: str, description: str, cost: float, currency: str) -> str:
+    """Fingerprint without member nets.
+
+    Catches expenses imported before import keys existed, where all we can
+    match on is what the expense document itself kept.
+    """
+    payload = "|".join(
+        [(date or "")[:10], description or "", f"{float(cost or 0):.2f}", currency or ""]
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def row_loose_key(row: dict) -> str:
+    return _loose_key(
+        row.get("date", ""),
+        row.get("description", ""),
+        row.get("cost", 0),
+        row.get("currency", ""),
+    )
+
+
+async def existing_import_keys(db, event_id: str) -> set[str]:
+    """Fingerprints of everything already sitting in an event."""
+    event = await db.event.find_one({"_id": ObjectId(event_id)}, {"expenses": 1})
+    if not event:
+        return set()
+    expense_ids = [
+        ref if isinstance(ref, ObjectId) else ObjectId(ref)
+        for ref in event.get("expenses", [])
+    ]
+    if not expense_ids:
+        return set()
+
+    expenses = await db.expense.find(
+        {"_id": {"$in": expense_ids}},
+        {"importKey": 1, "expenseName": 1, "date": 1, "originalAmount": 1,
+         "amount": 1, "currency": 1},
+    ).to_list(length=None)
+
+    keys: set[str] = set()
+    for expense in expenses:
+        if expense.get("importKey"):
+            keys.add(expense["importKey"])
+        original = expense.get("originalAmount")
+        if original is None:
+            original = expense.get("amount", 0)
+        keys.add(
+            _loose_key(
+                str(expense.get("date", ""))[:10],
+                expense.get("expenseName", ""),
+                original or 0,
+                expense.get("currency", ""),
+            )
+        )
+    return keys
+
+
+def split_new_rows(rows: list, existing_keys: set[str]) -> tuple[list, list]:
+    """Partition parsed rows into (new, already imported)."""
+    new_rows, duplicates = [], []
+    for row in rows:
+        if row_import_key(row) in existing_keys or row_loose_key(row) in existing_keys:
+            duplicates.append(row)
+        else:
+            new_rows.append(row)
+    return new_rows, duplicates
+
+
+def build_preview(
+    filename: str, parsed: dict, existing_keys: set[str] | None = None
+) -> dict:
     """Summary shown before the user maps members and confirms the import."""
     rows = parsed["rows"]
     currencies = sorted({r["currency"] for r in rows})
@@ -104,9 +201,14 @@ def build_preview(filename: str, parsed: dict) -> dict:
             if tail[0] == "_" and tail[1:5].isdigit():
                 event_name = event_name[:-suffix_len]
                 break
+    new_rows, duplicates = split_new_rows(rows, existing_keys or set())
+
     return {
         "members": parsed["members"],
         "rowCount": len(rows),
+        # When importing into an existing group, only the delta gets added.
+        "newRowCount": len(new_rows),
+        "duplicateRowCount": len(duplicates),
         "currencies": currencies,
         "dateRange": {
             "from": dates[0] if dates else None,
@@ -164,6 +266,7 @@ def _row_to_expense(row: dict, member_ids: dict, event_id: str) -> dict | None:
     return {
         "expenseName": row["description"],
         "amount": row["cost"],
+        "importKey": row_import_key(row),
         "category": row["category"] if not is_payment else "settle",
         "type": expense_type,
         "eventId": event_id,
@@ -181,11 +284,18 @@ async def import_splitwise(
     event_name: str,
     event_currency: str,
     mapping: dict,
+    event_id: str | None = None,
+    skip_existing: bool = True,
 ) -> dict:
     """Create an event + expenses from a parsed Splitwise export.
 
     ``mapping``: CSV member name -> {"userId": "..."} or {"email": "...",
     "name": "..."} (email creates/reuses a phantom user).
+
+    Passing ``event_id`` imports into an existing group instead of creating a
+    new one, and (unless ``skip_existing`` is off) brings in only the rows that
+    are not already there — so re-exporting a group after a trip tops it up
+    rather than duplicating the whole history.
     """
     importer = await user_service.get_user_by_id(db, user_id)
     importer_name = (importer or {}).get("name", "")
@@ -213,21 +323,45 @@ async def import_splitwise(
         else:
             raise ValueError(f"Mapping for '{member}' needs a userId or email")
 
-    event = await event_service.save_event(
-        db,
-        user_id,
-        {
-            "eventName": event_name,
-            "description": "Imported from Splitwise",
-            "users": list(member_ids.values()),
-            "currency": event_currency,
-        },
-    )
-    event_id = event["id"]
+    rows = parsed["rows"]
+    duplicates: list[dict] = []
+
+    if event_id:
+        event = await db.event.find_one({"_id": ObjectId(event_id)})
+        if not event:
+            raise ValueError("Event not found")
+        event_name = event.get("eventName", event_name)
+        # Anyone in the file who is not in the group yet joins it.
+        new_members = [
+            ObjectId(mid)
+            for mid in set(member_ids.values())
+            if ObjectId(mid) not in event.get("users", [])
+        ]
+        if new_members:
+            await db.event.update_one(
+                {"_id": event["_id"]},
+                {"$addToSet": {"users": {"$each": new_members}}},
+            )
+        if skip_existing:
+            rows, duplicates = split_new_rows(
+                rows, await existing_import_keys(db, event_id)
+            )
+    else:
+        event = await event_service.save_event(
+            db,
+            user_id,
+            {
+                "eventName": event_name,
+                "description": "Imported from Splitwise",
+                "users": list(member_ids.values()),
+                "currency": event_currency,
+            },
+        )
+        event_id = event["id"]
 
     imported = 0
     skipped: list[dict] = []
-    for index, row in enumerate(parsed["rows"]):
+    for index, row in enumerate(rows):
         payload = _row_to_expense(row, member_ids, event_id)
         if payload is None:
             skipped.append(
@@ -257,6 +391,7 @@ async def import_splitwise(
         "eventId": event_id,
         "eventName": event_name,
         "imported": imported,
+        "duplicates": len(duplicates),
         "skipped": skipped,
         "members": member_ids,
     }

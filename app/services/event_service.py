@@ -1,3 +1,5 @@
+import random
+import string
 from datetime import datetime, timezone
 from bson import ObjectId
 from fastapi import HTTPException
@@ -5,6 +7,246 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.config import settings
 from app.services import fx_service
 from app.services.user_service import serialize_doc, get_user_name_by_id
+
+
+class CurrencyChangeRequiresChoice(Exception):
+    """Raised when an event's currency changes while it still has expenses.
+
+    The caller has to say whether the existing transactions should be
+    re-converted into the new currency or left on their original one, so the
+    router turns this into a 409 the app answers with ``applyToExpenses``.
+    """
+
+    def __init__(self, expense_count: int, from_currency: str, to_currency: str):
+        self.expense_count = expense_count
+        self.from_currency = from_currency
+        self.to_currency = to_currency
+        super().__init__("Changing the group currency affects existing expenses")
+
+
+# ─── Multi-currency ledger ──────────────────────────────────────────────
+#
+# Every expense is recorded in the currency it was actually paid in. Debts are
+# therefore accumulated per currency and only collapsed into a single number at
+# display time, using the *viewer's* conversion rates. That keeps the raw
+# "you owe me $40 and €15" truth exact, and lets two members who disagree about
+# what a dollar cost them still see a consistent split.
+
+
+def _entry_amount(entry: dict) -> float:
+    """A share/payShare amount in the currency the expense was entered in."""
+    value = entry.get("originalAmount")
+    if value is None:
+        value = entry.get("amount", 0)
+    return float(value or 0)
+
+
+def _pair_key(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+def _signed_ledger(expenses: list) -> dict[tuple[str, str], dict[str, float]]:
+    """Net debts between every pair of members, per currency.
+
+    Result maps an ordered ``(first, second)`` pair to ``{currency: amount}``
+    where a positive amount means *first owes second*.
+    """
+    ledger: dict[tuple[str, str], dict[str, float]] = {}
+
+    for expense in expenses:
+        currency = fx_service.normalize_currency(expense.get("currency"))
+        shares = expense.get("shares", [])
+        pay_shares = expense.get("payShares", [])
+        total_paid = sum(_entry_amount(ps) for ps in pay_shares)
+        if total_paid == 0:
+            continue
+
+        for pay_share in pay_shares:
+            payer_id = str(pay_share["userId"])
+            payer_ratio = _entry_amount(pay_share) / total_paid
+            if payer_ratio == 0:
+                continue
+            for share in shares:
+                participant_id = str(share["userId"])
+                if participant_id == payer_id:
+                    continue
+                amount = _entry_amount(share) * payer_ratio
+                if amount == 0:
+                    continue
+                key = _pair_key(participant_id, payer_id)
+                # Positive means key[0] owes key[1].
+                signed = amount if key[0] == participant_id else -amount
+                bucket = ledger.setdefault(key, {})
+                bucket[currency] = bucket.get(currency, 0.0) + signed
+
+    # Drop currencies that netted out to nothing.
+    cleaned: dict[tuple[str, str], dict[str, float]] = {}
+    for key, by_currency in ledger.items():
+        kept = {
+            currency: round(amount, 2)
+            for currency, amount in by_currency.items()
+            if abs(round(amount, 2)) >= 0.01
+        }
+        if kept:
+            cleaned[key] = kept
+    return cleaned
+
+
+def _ledger_currencies(ledger: dict) -> set[str]:
+    return {currency for by_currency in ledger.values() for currency in by_currency}
+
+
+def _expense_currencies(expenses: list) -> set[str]:
+    return {
+        fx_service.normalize_currency(expense.get("currency")) for expense in expenses
+    }
+
+
+def _convert(by_currency: dict[str, float], rates: dict[str, float]) -> float:
+    """Collapse a per-currency map into one number using ``rates``."""
+    return round(
+        sum(amount * rates.get(currency, 1.0) for currency, amount in by_currency.items()),
+        2,
+    )
+
+
+def _split_by_sign(by_currency: dict[str, float], flip: bool) -> dict[str, float]:
+    """Per-currency amounts from one member's point of view.
+
+    Positive entries are what they owe, negative what they are owed; ``flip``
+    reverses the pair's stored direction.
+    """
+    sign = -1 if flip else 1
+    return {
+        currency: round(amount * sign, 2)
+        for currency, amount in by_currency.items()
+        if abs(amount) >= 0.01
+    }
+
+
+def _viewer_positions(
+    ledger: dict[tuple[str, str], dict[str, float]], viewer_id: str
+) -> dict[str, dict[str, float]]:
+    """Counterpart id -> per-currency amounts, positive = the viewer owes."""
+    positions: dict[str, dict[str, float]] = {}
+    for (first, second), by_currency in ledger.items():
+        if viewer_id == first:
+            positions[second] = _split_by_sign(by_currency, flip=False)
+        elif viewer_id == second:
+            positions[first] = _split_by_sign(by_currency, flip=True)
+    return positions
+
+
+async def get_member_rates(
+    db: AsyncIOMotorDatabase,
+    event: dict,
+    user_id: str,
+    currencies: set[str] | None = None,
+) -> dict[str, float]:
+    """Conversion rates into the event currency for one member.
+
+    A member may override any rate (``event.memberRates[userId]``) — useful when
+    the rate their bank actually charged differs from the market one. Anything
+    they have not overridden falls back to the market rate.
+    """
+    base = fx_service.normalize_currency(event.get("currency"))
+    overrides = ((event.get("memberRates") or {}).get(str(user_id)) or {})
+    rates: dict[str, float] = {base: 1.0}
+
+    for currency in currencies or set():
+        currency = fx_service.normalize_currency(currency)
+        if currency in rates:
+            continue
+        override = overrides.get(currency)
+        if override:
+            try:
+                rates[currency] = float(override)
+                continue
+            except (TypeError, ValueError):
+                pass
+        rates[currency] = await fx_service.get_rate(currency, base, db=db)
+    return rates
+
+
+async def get_event_rate_settings(
+    db: AsyncIOMotorDatabase, event_id: str, user_id: str
+) -> dict:
+    """The rate editor's payload: every currency in play, market vs. custom."""
+    event = await db.event.find_one({"_id": ObjectId(event_id)})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    base = fx_service.normalize_currency(event.get("currency"))
+    expenses = await _load_event_expenses(db, event)
+    currencies = _expense_currencies(expenses) | {base}
+    overrides = ((event.get("memberRates") or {}).get(str(user_id)) or {})
+
+    rates = []
+    for currency in sorted(currencies):
+        if currency == base:
+            continue
+        market = await fx_service.get_rate(currency, base, db=db)
+        override = overrides.get(currency)
+        rates.append(
+            {
+                "currency": currency,
+                "marketRate": market,
+                "rate": float(override) if override else market,
+                "isCustom": bool(override),
+            }
+        )
+
+    return {"eventId": str(event["_id"]), "baseCurrency": base, "rates": rates}
+
+
+async def set_event_member_rates(
+    db: AsyncIOMotorDatabase, event_id: str, user_id: str, rates: dict
+) -> dict:
+    """Store (or clear) one member's own conversion rates for an event."""
+    event = await db.event.find_one({"_id": ObjectId(event_id)}, {"currency": 1})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    base = fx_service.normalize_currency(event.get("currency"))
+
+    cleaned: dict[str, float] = {}
+    for currency, value in (rates or {}).items():
+        code = fx_service.normalize_currency(currency)
+        if code == base:
+            continue  # the event currency is always 1:1 with itself
+        if value in (None, ""):
+            continue  # omitted -> fall back to the market rate
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400, detail=f"Invalid rate for {code}"
+            )
+        if rate <= 0:
+            raise HTTPException(
+                status_code=400, detail=f"Rate for {code} must be greater than zero"
+            )
+        cleaned[code] = rate
+
+    field = f"memberRates.{user_id}"
+    if cleaned:
+        await db.event.update_one(
+            {"_id": ObjectId(event_id)}, {"$set": {field: cleaned}}
+        )
+    else:
+        await db.event.update_one(
+            {"_id": ObjectId(event_id)}, {"$unset": {field: ""}}
+        )
+    return await get_event_rate_settings(db, event_id, user_id)
+
+
+async def _load_event_expenses(db: AsyncIOMotorDatabase, event: dict) -> list:
+    expense_ids = [
+        ref if isinstance(ref, ObjectId) else ObjectId(ref)
+        for ref in event.get("expenses", [])
+    ]
+    if not expense_ids:
+        return []
+    return await db.expense.find({"_id": {"$in": expense_ids}}).to_list(length=None)
 
 
 async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
@@ -23,7 +265,14 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
                 "let": {"expensesIds": "$expenses"},
                 "pipeline": [
                     {"$match": {"$expr": {"$in": ["$_id", "$$expensesIds"]}}},
-                    {"$project": {"_id": 1, "payShares": 1, "shares": 1}},
+                    {
+                        "$project": {
+                            "_id": 1,
+                            "payShares": 1,
+                            "shares": 1,
+                            "currency": 1,
+                        }
+                    },
                 ],
                 "as": "eventExpenses",
             }
@@ -45,6 +294,7 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
                 "eventName": {"$first": "$eventName"},
                 "description": {"$first": "$description"},
                 "currency": {"$first": "$currency"},
+                "memberRates": {"$first": "$memberRates"},
                 "createdAt": {"$first": "$createdAt"},
                 "createdBy": {"$first": "$createdBy"},
                 "users": {"$first": "$users"},
@@ -85,9 +335,29 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
         viewer_currency, event_currencies, db=db
     )
 
+    # Names shown with an email suffix when two members share a display name.
+    for event in events:
+        for user_list in event.get("eventUsers", []):
+            for user in user_list:
+                name = user.get("name", "")
+                email = user.get("email", "")
+                if not name:
+                    continue
+                if name not in same_name_dict:
+                    same_name_dict[name] = email
+                elif email != same_name_dict[name]:
+                    same_name_list.add(name)
+
     for event in events:
         event_currency = fx_service.normalize_currency(event.get("currency"))
         event_rate = to_viewer_rates.get(event_currency, 1.0)
+        expenses = event.get("expenses", [])
+        ledger = _signed_ledger(expenses)
+        rates = await get_member_rates(
+            db, event, user_id, _ledger_currencies(ledger)
+        )
+        positions = _viewer_positions(ledger, str(user_id))
+
         event_dict = {
             "id": str(event["_id"]),
             "users": [str(u) for u in event.get("users", [])],
@@ -96,7 +366,7 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
             "currency": event_currency,
             "createdAt": str(event.get("createdAt", "")),
             "createdBy": str(event.get("createdBy", "")),
-            "expenses": [str(exp["_id"]) for exp in event.get("expenses", [])],
+            "expenses": [str(exp["_id"]) for exp in expenses],
             "dues": {
                 "userName": user_name,
                 "currency": event_currency,
@@ -107,66 +377,34 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
             },
         }
 
-        due_dict = {}
-        for expense in event.get("expenses", []):
-            shares = expense.get("shares", [])
-            pay_shares = expense.get("payShares", [])
-            total_paid = (
-                sum(float(ps["amount"]) for ps in pay_shares) if pay_shares else 0
-            )
-
-            for share in shares:
-                participant_id = str(share["userId"])
-                share_amount = float(share["amount"])
-
-                name = user_map.get(participant_id, {}).get("name", "")
-                email = user_map.get(participant_id, {}).get("email", "")
-                if name:
-                    if name not in same_name_dict:
-                        same_name_dict[name] = email
-                    elif email != same_name_dict[name]:
-                        same_name_list.add(name)
-
-                for pay_share in pay_shares:
-                    payer_id = str(pay_share["userId"])
-                    payer_amount = float(pay_share["amount"])
-                    if total_paid == 0:
-                        continue
-
-                    proportional_share = share_amount * (payer_amount / total_paid)
-
-                    if participant_id == payer_id:
-                        continue
-
-                    if participant_id == str(user_id):
-                        due_dict[payer_id] = (
-                            due_dict.get(payer_id, 0.0) + proportional_share
-                        )
-                    elif payer_id == str(user_id):
-                        due_dict[participant_id] = (
-                            due_dict.get(participant_id, 0.0) - proportional_share
-                        )
-
-        for due_id, amount in due_dict.items():
-            user_data = user_map.get(due_id, {})
+        for counterpart_id, by_currency in positions.items():
+            user_data = user_map.get(counterpart_id, {})
             name = user_data.get("name", "Unknown")
             if name in same_name_list:
                 name += f" ( {user_data.get('email', '')} )"
-            abs_amount = float(abs(amount))
-
+            amount = _convert(by_currency, rates)
+            if abs(amount) < 0.01:
+                continue
+            entry = {
+                "id": counterpart_id,
+                "name": name,
+                "amount": abs(amount),
+                "byCurrency": by_currency,
+            }
             if amount < 0:
-                event_dict["dues"]["isOwed"].append(
-                    {"id": str(due_id), "name": name, "amount": abs_amount}
-                )
-                event_dict["dues"]["totalOwed"] += abs_amount
-                overall_owe_amount += amount * event_rate
+                event_dict["dues"]["isOwed"].append(entry)
+                event_dict["dues"]["totalOwed"] += abs(amount)
             else:
-                event_dict["dues"]["inDebtTo"].append(
-                    {"id": str(due_id), "name": name, "amount": abs_amount}
-                )
-                event_dict["dues"]["totalDebt"] += abs_amount
-                overall_owe_amount += amount * event_rate
+                event_dict["dues"]["inDebtTo"].append(entry)
+                event_dict["dues"]["totalDebt"] += abs(amount)
+            overall_owe_amount += amount * event_rate
 
+        event_dict["dues"]["totalDebt"] = round(
+            float(event_dict["dues"]["totalDebt"]), 2
+        )
+        event_dict["dues"]["totalOwed"] = round(
+            float(event_dict["dues"]["totalOwed"]), 2
+        )
         events_list.append(event_dict)
 
     if overall_owe_amount < 0:
@@ -209,12 +447,214 @@ async def get_event_by_id(db: AsyncIOMotorDatabase, event_id: str) -> dict | Non
                     "id": str(user["_id"]),
                     "name": user.get("name", ""),
                     "email": user.get("email", ""),
+                    # Phantom members are the "unclaimed spots" a join link
+                    # lets a real person take over.
+                    "isPhantom": bool(user.get("isPhantom")),
                 }
             )
 
     result = serialize_doc(event)
     result["users"] = user_data
     return result
+
+
+# ─── Join links ─────────────────────────────────────────────────────────
+
+
+def _generate_join_code(length: int = 10) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(random.choice(alphabet) for _ in range(length))
+
+
+async def ensure_join_code(db: AsyncIOMotorDatabase, event_id: str) -> str:
+    """Return the event's join code, creating one on first use."""
+    event = await db.event.find_one({"_id": ObjectId(event_id)}, {"joinCode": 1})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    if event.get("joinCode"):
+        return event["joinCode"]
+
+    code = _generate_join_code()
+    while await db.event.find_one({"joinCode": code}):
+        code = _generate_join_code()
+    await db.event.update_one({"_id": event["_id"]}, {"$set": {"joinCode": code}})
+    return code
+
+
+async def rotate_join_code(db: AsyncIOMotorDatabase, event_id: str) -> str:
+    """Invalidate the old link and issue a new one."""
+    code = _generate_join_code()
+    while await db.event.find_one({"joinCode": code}):
+        code = _generate_join_code()
+    result = await db.event.update_one(
+        {"_id": ObjectId(event_id)}, {"$set": {"joinCode": code}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return code
+
+
+async def get_join_preview(
+    db: AsyncIOMotorDatabase, code: str, user_id: str | None
+) -> dict:
+    """What someone opening a group link sees before they commit to joining."""
+    event = await db.event.find_one({"joinCode": (code or "").strip().upper()})
+    if not event:
+        raise HTTPException(status_code=404, detail="This group link is not valid")
+
+    members = []
+    for user_ref in event.get("users", []):
+        member = await db.users.find_one(
+            {"_id": user_ref if isinstance(user_ref, ObjectId) else ObjectId(user_ref)}
+        )
+        if not member:
+            continue
+        members.append(
+            {
+                "id": str(member["_id"]),
+                "name": member.get("name", ""),
+                # A phantom's email is a placeholder the importer typed, so it
+                # is only a hint about who the spot belongs to.
+                "email": member.get("email", "") if member.get("isPhantom") else "",
+                "isPhantom": bool(member.get("isPhantom")),
+            }
+        )
+
+    return {
+        "eventId": str(event["_id"]),
+        "eventName": event.get("eventName", ""),
+        "description": event.get("description", ""),
+        "currency": fx_service.normalize_currency(event.get("currency")),
+        "memberCount": len(members),
+        "members": members,
+        # Unclaimed spots: a new member can take one of these over instead of
+        # being added as an extra person with no history.
+        "claimableMembers": [m for m in members if m["isPhantom"]],
+        "isMember": bool(
+            user_id and ObjectId(user_id) in event.get("users", [])
+        ),
+    }
+
+
+async def join_event(
+    db: AsyncIOMotorDatabase,
+    code: str,
+    user_id: str,
+    claim_member_id: str | None = None,
+) -> dict:
+    """Join a group from its link, optionally claiming an existing spot."""
+    from app.services import user_service
+
+    event = await db.event.find_one({"joinCode": (code or "").strip().upper()})
+    if not event:
+        raise HTTPException(status_code=404, detail="This group link is not valid")
+
+    event_id = str(event["_id"])
+    user_oid = ObjectId(user_id)
+    member_ids = {str(u) for u in event.get("users", [])}
+
+    if claim_member_id:
+        if claim_member_id not in member_ids:
+            raise HTTPException(
+                status_code=400, detail="That member is not part of this group"
+            )
+        if claim_member_id == user_id:
+            raise HTTPException(status_code=400, detail="That spot is already yours")
+        # Absorbs the placeholder's whole history — shares, payments, balances.
+        await user_service.merge_phantom_into_user(db, claim_member_id, user_id)
+    elif user_id in member_ids:
+        return {
+            "eventId": event_id,
+            "eventName": event.get("eventName", ""),
+            "joined": False,
+            "alreadyMember": True,
+        }
+    else:
+        await db.event.update_one(
+            {"_id": event["_id"]}, {"$addToSet": {"users": user_oid}}
+        )
+
+    for member_id in member_ids:
+        if member_id != user_id and member_id != claim_member_id:
+            await _auto_add_friend(db, user_id, member_id)
+
+    return {
+        "eventId": event_id,
+        "eventName": event.get("eventName", ""),
+        "joined": True,
+        "claimed": bool(claim_member_id),
+    }
+
+
+# ─── Create / update ────────────────────────────────────────────────────
+
+
+async def get_currency_change_impact(
+    db: AsyncIOMotorDatabase, event_id: str, new_currency: str
+) -> dict:
+    """How many transactions a currency switch would touch (drives the prompt)."""
+    event = await db.event.find_one(
+        {"_id": ObjectId(event_id)}, {"currency": 1, "expenses": 1}
+    )
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    current = fx_service.normalize_currency(event.get("currency"))
+    target = fx_service.normalize_currency(new_currency)
+    expense_count = len(event.get("expenses", []))
+    return {
+        "fromCurrency": current,
+        "toCurrency": target,
+        "expenseCount": expense_count,
+        "requiresChoice": target != current and expense_count > 0,
+    }
+
+
+async def _reconvert_event_expenses(
+    db: AsyncIOMotorDatabase, event: dict, new_currency: str
+) -> int:
+    """Re-express every expense in the event's new currency.
+
+    Each expense keeps the currency it was actually paid in; only the stored
+    conversion into the group currency is recomputed, at the rate for that
+    expense's own date.
+    """
+    expenses = await _load_event_expenses(db, event)
+    updated = 0
+    for expense in expenses:
+        currency = fx_service.normalize_currency(expense.get("currency"))
+        rate = await fx_service.get_rate(
+            currency, new_currency, on=expense.get("date"), db=db
+        )
+
+        def _reconvert(entries: list) -> list:
+            converted = []
+            for entry in entries:
+                original = _entry_amount(entry)
+                new_entry = dict(entry)
+                new_entry["originalAmount"] = original
+                new_entry["amount"] = round(original * rate, 2)
+                converted.append(new_entry)
+            return converted
+
+        original_total = expense.get("originalAmount")
+        if original_total is None:
+            original_total = expense.get("amount", 0)
+
+        await db.expense.update_one(
+            {"_id": expense["_id"]},
+            {
+                "$set": {
+                    "amount": round(float(original_total or 0) * rate, 2),
+                    "originalAmount": float(original_total or 0),
+                    "baseCurrency": new_currency,
+                    "fxRate": rate,
+                    "shares": _reconvert(expense.get("shares", [])),
+                    "payShares": _reconvert(expense.get("payShares", [])),
+                }
+            },
+        )
+        updated += 1
+    return updated
 
 
 async def save_event(
@@ -267,18 +707,27 @@ async def save_event(
             "updatedAt": now,
         }
 
-        # Currency can only change while the event has no expenses — otherwise
-        # stored converted amounts would no longer match the event currency.
+        # Changing the group currency re-prices history, so the caller has to
+        # choose: re-convert every transaction into the new currency, or leave
+        # them as they are (each expense keeps its own recorded currency either
+        # way — only the group-level view changes).
         new_currency = request_data.get("currency")
+        reconverted = 0
         if new_currency:
             new_currency = fx_service.normalize_currency(new_currency)
             current_currency = fx_service.normalize_currency(event.get("currency"))
             if new_currency != current_currency:
-                if event.get("expenses"):
-                    raise ValueError(
-                        "Cannot change event currency after expenses are added"
+                apply_to_expenses = request_data.get("applyToExpenses")
+                expense_count = len(event.get("expenses", []))
+                if expense_count and apply_to_expenses is None:
+                    raise CurrencyChangeRequiresChoice(
+                        expense_count, current_currency, new_currency
                     )
                 update_data["currency"] = new_currency
+                if expense_count and apply_to_expenses:
+                    reconverted = await _reconvert_event_expenses(
+                        db, event, new_currency
+                    )
 
         await db.event.update_one({"_id": ObjectId(event_id)}, {"$set": update_data})
 
@@ -288,7 +737,10 @@ async def save_event(
                 await _auto_add_friend(db, user_id, str(uid))
 
         await _send_member_invites(db, user_id, invited)
-        return await get_event_by_id(db, event_id)
+        result = await get_event_by_id(db, event_id)
+        if result is not None:
+            result["reconvertedExpenses"] = reconverted
+        return result
     else:
         # Create new event
         user_ids, invited = await _resolve_users(
@@ -309,12 +761,17 @@ async def save_event(
             currency = (creator or {}).get("defaultCurrency")
         currency = fx_service.normalize_currency(currency)
 
+        join_code = _generate_join_code()
+        while await db.event.find_one({"joinCode": join_code}):
+            join_code = _generate_join_code()
+
         new_event = {
             "eventName": request_data.get("eventName", "Untitled Event"),
             "description": request_data.get("description", ""),
             "currency": currency,
             "users": user_ids,
             "expenses": [],
+            "joinCode": join_code,
             "createdBy": creator_oid,
             "createdAt": now,
             "updatedBy": creator_oid,
@@ -438,153 +895,245 @@ async def delete_event(db: AsyncIOMotorDatabase, event_id: str) -> dict:
     return {"message": "Successfully deleted event", "success": "true"}
 
 
-async def get_event_dues(db: AsyncIOMotorDatabase, event_id: str) -> dict:
-    """Calculate who owes whom within an event."""
+# ─── Dues & totals ──────────────────────────────────────────────────────
+
+
+async def get_event_dues(
+    db: AsyncIOMotorDatabase, event_id: str, viewer_id: str | None = None
+) -> dict:
+    """Calculate who owes whom within an event.
+
+    Amounts are netted per currency; ``amount`` is that netted position
+    converted into the event currency with ``viewer_id``'s rates (market rates
+    when no viewer is given).
+    """
     event = await db.event.find_one({"_id": ObjectId(event_id)})
     if not event:
         return {"error": "Event not found"}
 
-    # Get all expenses for the event
-    expense_ids = []
-    for exp_ref in event.get("expenses", []):
-        exp_id = exp_ref if isinstance(exp_ref, ObjectId) else ObjectId(exp_ref)
-        expense_ids.append(exp_id)
+    expenses = await _load_event_expenses(db, event)
+    ledger = _signed_ledger(expenses)
+    currencies = _ledger_currencies(ledger)
+    rates = await get_member_rates(db, event, viewer_id or "", currencies)
 
-    expenses = await db.expense.find({"_id": {"$in": expense_ids}}).to_list(
-        length=None
-    )
+    user_name_map: dict[str, str] = {}
 
-    amounts_owed = {}
-    user_name_map = {}
-    calculated_list = []
+    async def _name(user_id: str) -> str:
+        if user_id not in user_name_map:
+            user_name_map[user_id] = await get_user_name_by_id(db, user_id)
+        return user_name_map[user_id]
 
-    for expense in expenses:
-        shares = expense.get("shares", [])
-        pay_shares = expense.get("payShares", [])
+    # debtor -> creditor -> per-currency amounts owed
+    debts: dict[str, dict[str, dict[str, float]]] = {}
+    for (first, second), by_currency in ledger.items():
+        amount = _convert(by_currency, rates)
+        if abs(amount) < 0.01:
+            continue
+        if amount > 0:
+            debtor, creditor, flip = first, second, False
+        else:
+            debtor, creditor, flip = second, first, True
+        debts.setdefault(debtor, {})[creditor] = {
+            "amount": abs(amount),
+            "byCurrency": _split_by_sign(by_currency, flip=flip),
+        }
 
-        for pay_share in pay_shares:
-            payer_id = str(pay_share["userId"])
-
-            for share in shares:
-                share_amount = float(share["amount"])
-                participant_id = str(share["userId"])
-
-                if participant_id == payer_id:
-                    continue
-
-                if participant_id not in amounts_owed:
-                    amounts_owed[participant_id] = {}
-                if payer_id not in amounts_owed[participant_id]:
-                    amounts_owed[participant_id][payer_id] = 0.0
-
-                total_paid = sum(float(ps["amount"]) for ps in pay_shares)
-                payer_ratio = (
-                    float(pay_share["amount"]) / total_paid if total_paid != 0 else 0
-                )
-                proportional_share = share_amount * payer_ratio
-
-                amounts_owed[participant_id][payer_id] += proportional_share
-
-    # Resolve net debts
-    for participant, debts in amounts_owed.items():
-        for payer, amount in debts.items():
-            key1 = payer + participant
-            key2 = participant + payer
-            if key1 not in calculated_list and key2 not in calculated_list:
-                reverse_exist = False
-                payer_to_participant = 0
-                participant_to_payer = amount
-
-                if payer in amounts_owed and participant in amounts_owed[payer]:
-                    reverse_exist = True
-                    payer_to_participant = amounts_owed[payer][participant]
-
-                net_amount = participant_to_payer - payer_to_participant
-                if net_amount > 0:
-                    amounts_owed[participant][payer] = net_amount
-                    if reverse_exist:
-                        amounts_owed[payer][participant] = 0
-                elif net_amount < 0:
-                    if not reverse_exist:
-                        amounts_owed[payer] = amounts_owed.get(payer, {})
-                    amounts_owed[payer][participant] = -net_amount
-                    amounts_owed[participant][payer] = 0
-                else:
-                    if reverse_exist:
-                        amounts_owed[payer][participant] = 0
-                    amounts_owed[participant][payer] = 0
-
-                if payer not in user_name_map:
-                    user_name_map[payer] = await get_user_name_by_id(db, payer)
-                if participant not in user_name_map:
-                    user_name_map[participant] = await get_user_name_by_id(
-                        db, participant
-                    )
-
-                calculated_list.append(key1)
-
-    # Format response
     event_dues = []
-    for debtor in amounts_owed:
-        debtor_name = user_name_map.get(str(debtor), "Unknown")
+    for debtor, creditors in debts.items():
         creditor_details = []
-        for creditor in amounts_owed[debtor]:
-            amount = amounts_owed[debtor][creditor]
-            if amount != 0:
-                creditor_name = user_name_map.get(str(creditor), "Unknown")
-                creditor_details.append(
-                    {"id": creditor, "name": creditor_name, "amount": amount}
-                )
+        for creditor, position in creditors.items():
+            creditor_details.append(
+                {
+                    "id": creditor,
+                    "name": await _name(creditor),
+                    "amount": position["amount"],
+                    "byCurrency": position["byCurrency"],
+                }
+            )
         event_dues.append(
-            {"id": debtor, "debtor": debtor_name, "creditorDetails": creditor_details}
+            {
+                "id": debtor,
+                "debtor": await _name(debtor),
+                "creditorDetails": creditor_details,
+            }
         )
 
     return {
         "eventDues": event_dues,
-        "currency": event.get("currency", settings.DEFAULT_CURRENCY),
+        "currency": fx_service.normalize_currency(event.get("currency")),
+        "currencies": sorted(currencies),
+        "rates": rates,
     }
+
+
+def _merge_currency_totals(target: dict[str, float], source: dict[str, float]) -> None:
+    for currency, amount in source.items():
+        target[currency] = round(target.get(currency, 0.0) + amount, 2)
 
 
 async def get_event_dues_for_user(
     db: AsyncIOMotorDatabase, event_id: str, user_id: str
 ) -> dict:
     """Calculate who owes whom for a specific user within an event."""
+    event = await db.event.find_one({"_id": ObjectId(event_id)})
+    if not event:
+        return {
+            "userName": "",
+            "currency": settings.DEFAULT_CURRENCY,
+            "inDebtTo": [],
+            "isOwed": [],
+            "totalDebt": 0,
+            "totalOwed": 0,
+        }
+
+    expenses = await _load_event_expenses(db, event)
+    ledger = _signed_ledger(expenses)
+    rates = await get_member_rates(db, event, user_id, _ledger_currencies(ledger))
+    positions = _viewer_positions(ledger, str(user_id))
+
     result = {
-        "userName": "",
-        "currency": settings.DEFAULT_CURRENCY,
+        "userName": await get_user_name_by_id(db, user_id),
+        "currency": fx_service.normalize_currency(event.get("currency")),
         "inDebtTo": [],
         "isOwed": [],
-        "totalDebt": 0,
-        "totalOwed": 0,
+        "totalDebt": 0.0,
+        "totalOwed": 0.0,
+        # Per-currency totals let the app show "you owe $40 and ₹600" without
+        # any conversion at all.
+        "totalDebtByCurrency": {},
+        "totalOwedByCurrency": {},
+        "currencies": sorted(_ledger_currencies(ledger)),
+        "rates": rates,
     }
 
-    user_name = await get_user_name_by_id(db, user_id)
-    result["userName"] = user_name
+    for counterpart_id, by_currency in positions.items():
+        amount = _convert(by_currency, rates)
+        if abs(amount) < 0.01:
+            continue
+        entry = {
+            "id": counterpart_id,
+            "name": await get_user_name_by_id(db, counterpart_id),
+            "amount": abs(amount),
+            "byCurrency": by_currency,
+        }
+        if amount > 0:
+            result["inDebtTo"].append(entry)
+            result["totalDebt"] += abs(amount)
+        else:
+            result["isOwed"].append(entry)
+            result["totalOwed"] += abs(amount)
 
-    event_dues_summary = await get_event_dues(db, event_id)
-    result["currency"] = event_dues_summary.get(
-        "currency", settings.DEFAULT_CURRENCY
-    )
+        # Per-currency totals follow each currency's own direction, which can
+        # differ from the converted net (owing dollars while being owed rupees).
+        _merge_currency_totals(
+            result["totalDebtByCurrency"],
+            {c: a for c, a in by_currency.items() if a > 0},
+        )
+        _merge_currency_totals(
+            result["totalOwedByCurrency"],
+            {c: -a for c, a in by_currency.items() if a < 0},
+        )
 
-    if event_dues_summary and "eventDues" in event_dues_summary:
-        for person_in_debt in event_dues_summary["eventDues"]:
-            if person_in_debt["id"] == user_id:
-                for owed_person in person_in_debt.get("creditorDetails", []):
-                    result["inDebtTo"].append(owed_person)
-                    result["totalDebt"] += owed_person["amount"]
-            else:
-                for owed_person in person_in_debt.get("creditorDetails", []):
-                    if owed_person["id"] == user_id:
-                        result["isOwed"].append(
-                            {
-                                "id": person_in_debt["id"],
-                                "name": person_in_debt["debtor"],
-                                "amount": owed_person["amount"],
-                            }
-                        )
-                        result["totalOwed"] += owed_person["amount"]
-
+    result["totalDebt"] = round(result["totalDebt"], 2)
+    result["totalOwed"] = round(result["totalOwed"], 2)
     return result
+
+
+async def get_event_summary(
+    db: AsyncIOMotorDatabase, event_id: str, user_id: str
+) -> dict:
+    """Per-member spend/paid totals for an event, plus the group total.
+
+    ``paid`` is what someone put on the table, ``spend`` is their own share of
+    the bills, and ``net`` is the difference — positive when the group owes
+    them. Every figure is given both per original currency and converted into
+    the group currency at the viewer's rates.
+    """
+    event = await db.event.find_one({"_id": ObjectId(event_id)})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    expenses = await _load_event_expenses(db, event)
+    base = fx_service.normalize_currency(event.get("currency"))
+    currencies = _expense_currencies(expenses)
+    rates = await get_member_rates(db, event, user_id, currencies)
+
+    paid: dict[str, dict[str, float]] = {}
+    spend: dict[str, dict[str, float]] = {}
+    # Money moved between members to square up, kept out of "spend" so it never
+    # looks like the group consumed anything. Positive = paid out.
+    settled: dict[str, dict[str, float]] = {}
+    group_total: dict[str, float] = {}
+
+    def _add(bucket: dict, member_id: str, currency: str, amount: float) -> None:
+        totals = bucket.setdefault(member_id, {})
+        totals[currency] = round(totals.get(currency, 0.0) + amount, 2)
+
+    for expense in expenses:
+        currency = fx_service.normalize_currency(expense.get("currency"))
+        is_settlement = expense.get("type") == "settle"
+
+        for pay_share in expense.get("payShares", []):
+            member_id = str(pay_share["userId"])
+            amount = _entry_amount(pay_share)
+            if is_settlement:
+                _add(settled, member_id, currency, amount)
+            else:
+                _add(paid, member_id, currency, amount)
+                group_total[currency] = round(
+                    group_total.get(currency, 0.0) + amount, 2
+                )
+
+        for share in expense.get("shares", []):
+            member_id = str(share["userId"])
+            amount = _entry_amount(share)
+            if is_settlement:
+                # The receiving side of a settlement.
+                _add(settled, member_id, currency, -amount)
+            else:
+                _add(spend, member_id, currency, amount)
+
+    members = []
+    for user_ref in event.get("users", []):
+        member_oid = user_ref if isinstance(user_ref, ObjectId) else ObjectId(user_ref)
+        member_id = str(member_oid)
+        member = await db.users.find_one({"_id": member_oid}, {"name": 1, "email": 1})
+        member_paid = paid.get(member_id, {})
+        member_spend = spend.get(member_id, {})
+        member_settled = settled.get(member_id, {})
+        paid_total = _convert(member_paid, rates)
+        spend_total = _convert(member_spend, rates)
+        settled_total = _convert(member_settled, rates)
+        members.append(
+            {
+                "id": member_id,
+                "name": (member or {}).get("name", "Unknown"),
+                "isYou": member_id == str(user_id),
+                "paid": paid_total,
+                "spend": spend_total,
+                "settled": settled_total,
+                # Positive when the group still owes them. Settling up moves
+                # this towards zero without touching what anyone spent.
+                "net": round(paid_total - spend_total + settled_total, 2),
+                "paidByCurrency": member_paid,
+                "spendByCurrency": member_spend,
+                "settledByCurrency": member_settled,
+            }
+        )
+
+    members.sort(key=lambda m: m["spend"], reverse=True)
+
+    return {
+        "eventId": str(event["_id"]),
+        "eventName": event.get("eventName", ""),
+        "currency": base,
+        "currencies": sorted(currencies),
+        "rates": rates,
+        "total": _convert(group_total, rates),
+        "totalByCurrency": group_total,
+        "expenseCount": len(expenses),
+        "members": members,
+    }
 
 
 async def get_event_or_friend_users(

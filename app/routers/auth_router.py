@@ -8,6 +8,39 @@ from app.models.schemas import LoginRequest, SignupRequest, ChangePasswordReques
 router = APIRouter()
 
 
+@router.get("/invite/validate")
+async def validate_invite(
+    code: str = "",
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Check an invite code before signing up.
+
+    Deliberately unauthenticated: with Google sign-in the code has to be
+    checked *before* the OAuth redirect, when there is no session yet — being
+    bounced after a round trip through Google because of a typo is miserable.
+    Only tells the caller whether a code works and who it came from.
+    """
+    code = (code or "").strip().upper()
+    # The very first account bootstraps the instance and needs no invite.
+    if await db.users.count_documents({}, limit=1) == 0:
+        return {"valid": True, "required": False, "type": "bootstrap"}
+
+    if not code:
+        return {"valid": False, "required": True, "reason": "Invite code is required"}
+
+    invite = await user_service.resolve_invite_code(db, code)
+    if not invite:
+        return {"valid": False, "required": True, "reason": "That invite code is not valid"}
+
+    return {
+        "valid": True,
+        "required": True,
+        "type": invite["type"],
+        "invitedBy": invite.get("inviterName", ""),
+        "groupName": invite.get("eventName", ""),
+    }
+
+
 # /login and /signup use the verify-only dependency: get_current_user would
 # auto-create the Mongo user before these handlers run, without the invite
 # code from the request body — rejecting every new (non-first) user.

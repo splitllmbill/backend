@@ -87,13 +87,16 @@ async def find_or_create_user(
     is_first_user = user_count == 0
     role = "admin" if is_first_user else "user"
     invited_by = None
-    
+    invite = None
+
     if not is_first_user:
         if not invite_code:
             raise HTTPException(status_code=400, detail="Invite code is required for registration.")
-        # Validate invite code (friendCode)
-        inviter = await db.users.find_one({"friendCode": invite_code})
-        if not inviter:
+        # An invite code is either a member's friendCode or an event join code
+        # (the "claim your spot" group link), so a group link is enough to sign
+        # up with — the group itself vouches for the new member.
+        invite = await resolve_invite_code(db, invite_code)
+        if not invite:
             raise HTTPException(status_code=400, detail="Invalid invite code.")
         invited_by = invite_code
 
@@ -132,7 +135,8 @@ async def find_or_create_user(
         
         # Link phantom user expenses
         await link_phantom_expenses(db, email, str(updated_user["_id"]))
-        
+        await apply_invite(db, invite, updated_user["_id"])
+
         return serialize_doc(updated_user)
     except pymongo.errors.DuplicateKeyError:
         # Just in case there is a friendCode collision or another edge case, fallback to find
@@ -150,8 +154,120 @@ async def find_or_create_user(
         
         # Link phantom user expenses
         await link_phantom_expenses(db, email, str(updated_user["_id"]))
-        
+        await apply_invite(db, invite, updated_user["_id"])
+
         return serialize_doc(updated_user)
+
+
+async def resolve_invite_code(db: AsyncIOMotorDatabase, code: str) -> dict | None:
+    """Resolve a signup invite code to its source.
+
+    Two kinds of code are accepted:
+    * a registered member's ``friendCode`` — the classic personal invite;
+    * an event's ``joinCode`` — the group share link, so someone handed a group
+      link can register and land straight in that group.
+
+    Returns ``None`` when the code matches neither.
+    """
+    code = (code or "").strip().upper()
+    if not code:
+        return None
+
+    inviter = await db.users.find_one(
+        {"friendCode": code, "isDeleted": {"$ne": True}}, {"_id": 1, "name": 1}
+    )
+    if inviter:
+        return {
+            "type": "friend",
+            "inviterId": inviter["_id"],
+            "inviterName": inviter.get("name", ""),
+        }
+
+    event = await db.event.find_one(
+        {"joinCode": code}, {"_id": 1, "eventName": 1, "createdBy": 1}
+    )
+    if event:
+        return {
+            "type": "event",
+            "eventId": event["_id"],
+            "eventName": event.get("eventName", ""),
+            "inviterId": event.get("createdBy"),
+        }
+    return None
+
+
+async def apply_invite(db: AsyncIOMotorDatabase, invite: dict | None, user_oid) -> None:
+    """Act on the invite a new account was created with.
+
+    A group join code also adds the new member to that event, so the link they
+    followed actually lands them in the group instead of just unlocking signup.
+    """
+    if not invite or invite.get("type") != "event":
+        return
+    await db.event.update_one(
+        {"_id": invite["eventId"]}, {"$addToSet": {"users": user_oid}}
+    )
+
+
+async def merge_phantom_into_user(
+    db: AsyncIOMotorDatabase, phantom_id: str, user_id: str
+) -> None:
+    """Move everything a phantom placeholder holds onto a real account.
+
+    Used when someone claims a spot in a group they were added to under a name
+    the importer typed (rather than their own email, which the signup path
+    already links by itself). Refuses anything that is not a phantom so a real
+    account can never be absorbed into another.
+    """
+    phantom_oid = ObjectId(phantom_id)
+    user_oid = ObjectId(user_id)
+    if phantom_oid == user_oid:
+        return
+
+    phantom = await db.users.find_one({"_id": phantom_oid})
+    if not phantom or not phantom.get("isPhantom"):
+        raise HTTPException(status_code=400, detail="That member has already joined.")
+
+    # Expense participation: shares, payShares and authorship.
+    await db.expense.update_many(
+        {"shares.userId": phantom_oid},
+        {"$set": {"shares.$[elem].userId": user_oid}},
+        array_filters=[{"elem.userId": phantom_oid}],
+    )
+    await db.expense.update_many(
+        {"payShares.userId": phantom_oid},
+        {"$set": {"payShares.$[elem].userId": user_oid}},
+        array_filters=[{"elem.userId": phantom_oid}],
+    )
+    await db.expense.update_many(
+        {"createdBy": phantom_oid}, {"$set": {"createdBy": user_oid}}
+    )
+    await db.expense.update_many(
+        {"updatedBy": phantom_oid}, {"$set": {"updatedBy": user_oid}}
+    )
+
+    # Event membership: add the real user everywhere the phantom was, then drop
+    # the phantom. Done in two steps so an event holding both never duplicates.
+    await db.event.update_many(
+        {"users": phantom_oid}, {"$addToSet": {"users": user_oid}}
+    )
+    await db.event.update_many({"users": phantom_oid}, {"$pull": {"users": phantom_oid}})
+    await db.event.update_many({"createdBy": phantom_oid}, {"$set": {"createdBy": user_oid}})
+
+    # Per-member FX overrides keyed by the phantom are meaningless now.
+    await db.event.update_many(
+        {f"memberRates.{phantom_id}": {"$exists": True}},
+        {"$unset": {f"memberRates.{phantom_id}": ""}},
+    )
+
+    # Friendships: everyone who knew the phantom now knows the real user.
+    await db.users.update_many(
+        {"friends": phantom_oid}, {"$addToSet": {"friends": user_oid}}
+    )
+    await db.users.update_many({"friends": phantom_oid}, {"$pull": {"friends": phantom_oid}})
+    await db.users.update_one({"_id": user_oid}, {"$pull": {"friends": phantom_oid}})
+
+    await db.users.delete_one({"_id": phantom_oid})
 
 
 async def create_phantom_user(

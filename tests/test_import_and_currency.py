@@ -124,3 +124,80 @@ def test_expense_currency_conversion(client):
     assert data["originalAmount"] == 10.0
     assert data["fxRate"] == pytest.approx(80.0)
     assert data["amount"] == pytest.approx(800.0)
+
+
+# ─── Delta imports ──────────────────────────────────────────────────────
+
+EXTRA_ROW = "2023-03-12,Breakfast,Dining out,100.00,INR,-25.00,-25.00,75.00,-25.00"
+EXTENDED_CSV = SAMPLE_CSV.replace(
+    "\n2026-07-15,Total balance", f"\n{EXTRA_ROW}\n2026-07-15,Total balance"
+)
+
+
+def _mapping(client):
+    account = client.get("/db/user/account").json()
+    return {
+        "Saroja": {"email": "saroja@example.com"},
+        "Adithya Prakash MIT": {"email": "adithya@example.com"},
+        "Sivaganesh B": {"userId": account["id"]},
+        "Sivassri Suresh": {"email": "sivassri@example.com"},
+    }
+
+
+def _import(client, csv_text, **form):
+    return client.post(
+        "/db/import/splitwise",
+        files={"file": ("group_export.csv", csv_text, "text/csv")},
+        data={"mapping": json.dumps(_mapping(client)), **form},
+    )
+
+
+def test_reimporting_into_an_event_only_adds_the_delta(client):
+    created = _import(client, SAMPLE_CSV, eventName="Delta Trip", currency="INR")
+    assert created.status_code == 200, created.text
+    event_id = created.json()["eventId"]
+    assert created.json()["imported"] == 4
+
+    # The same export again is entirely duplicates — nothing gets added twice.
+    again = _import(client, SAMPLE_CSV, eventId=event_id)
+    assert again.status_code == 200, again.text
+    assert again.json()["imported"] == 0
+    assert again.json()["duplicates"] == 4
+    assert again.json()["eventId"] == event_id
+
+    # A later export with one more expense brings in exactly that row.
+    topped_up = _import(client, EXTENDED_CSV, eventId=event_id)
+    assert topped_up.status_code == 200, topped_up.text
+    assert topped_up.json()["imported"] == 1
+    assert topped_up.json()["duplicates"] == 4
+
+    listing = client.get(f"/db/event/{event_id}/expenses").json()
+    assert len(listing["expenses"]) == 5
+    assert [e for e in listing["expenses"] if e["expenseName"] == "Breakfast"]
+
+
+def test_preview_reports_how_much_of_a_file_is_new(client):
+    created = _import(client, SAMPLE_CSV, eventName="Preview Trip", currency="INR")
+    event_id = created.json()["eventId"]
+
+    preview = client.post(
+        "/db/import/splitwise/preview",
+        files={"file": ("group_export.csv", EXTENDED_CSV, "text/csv")},
+        data={"eventId": event_id},
+    )
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["rowCount"] == 5
+    assert body["newRowCount"] == 1
+    assert body["duplicateRowCount"] == 4
+    # Existing members come back so the mapping UI can pre-fill itself.
+    assert len(body["eventMembers"]) == 4
+
+
+def test_preview_without_an_event_treats_everything_as_new(client):
+    preview = client.post(
+        "/db/import/splitwise/preview",
+        files={"file": ("group_export.csv", SAMPLE_CSV, "text/csv")},
+    ).json()
+    assert preview["newRowCount"] == preview["rowCount"] == 4
+    assert preview["duplicateRowCount"] == 0

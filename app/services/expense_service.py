@@ -425,6 +425,27 @@ async def get_event_expenses_with_summary(
         db, event or {}, user_id, currencies
     )
 
+    # One lookup for every name on the list, rather than one per expense.
+    participant_ids = {
+        entry["userId"]
+        for expense in expenses
+        for entry in expense.get("payShares", []) + expense.get("shares", [])
+        if entry.get("userId")
+    }
+    names = {}
+    if participant_ids:
+        async for user in db.users.find(
+            {"_id": {"$in": list(participant_ids)}}, {"name": 1}
+        ):
+            names[str(user["_id"])] = user.get("name", "Unknown")
+
+    def _names(entries: list) -> str:
+        return ", ".join(
+            "You" if str(e["userId"]) == str(user_id)
+            else names.get(str(e["userId"]), "Unknown")
+            for e in entries
+        )
+
     expenses_with_summary = []
     for expense in expenses:
         original_currency = fx_service.normalize_currency(expense.get("currency"))
@@ -440,6 +461,12 @@ async def get_event_expenses_with_summary(
                 "expenseId": str(expense["_id"]),
                 "expenseDate": str(expense.get("date", "")),
                 "type": expense.get("type", ""),
+                "paidByName": _names(expense.get("payShares", [])),
+                # For a settlement the shares side is who received the money,
+                # which is what makes "A paid B" readable in the list.
+                "paidToName": _names(expense.get("shares", []))
+                if expense.get("type") == "settle"
+                else "",
                 # `amount`/`currency` stay in the group currency for callers
                 # that only care about one number.
                 "amount": round(original_amount * rate, 2),

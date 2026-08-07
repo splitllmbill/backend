@@ -876,15 +876,24 @@ async def delete_event(db: AsyncIOMotorDatabase, event_id: str) -> dict:
     if not event:
         return {"message": "Event not found", "success": "false"}
 
-    # Check for unsettled dues
+    # Deleting takes the expenses with it, so an unsettled group is refused:
+    # the balances would vanish along with the record of why they existed.
     dues = await get_event_dues(db, event_id)
-    if dues and "eventDues" in dues:
-        for due in dues["eventDues"]:
-            if due.get("creditorDetails") and len(due["creditorDetails"]) > 0:
-                return {
-                    "message": "Cannot delete event. There are unsettled dues.",
-                    "success": "false",
-                }
+    outstanding = []
+    for due in (dues or {}).get("eventDues", []):
+        for creditor in due.get("creditorDetails", []):
+            outstanding.append(f"{due.get('debtor')} owes {creditor.get('name')}")
+    if outstanding:
+        detail = ", ".join(outstanding[:3])
+        if len(outstanding) > 3:
+            detail += f" and {len(outstanding) - 3} more"
+        return {
+            "message": (
+                f"Cannot delete this group — {detail}. Settle up first, "
+                "or delete the expenses."
+            ),
+            "success": "false",
+        }
 
     # Delete all expenses
     for expense_ref in event.get("expenses", []):

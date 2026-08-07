@@ -219,6 +219,14 @@ async def delete_event(
         raise HTTPException(status_code=404, detail="Event not found")
 
     result = await event_service.delete_event(db, event_id)
+    # A refusal used to come back as 200 with success:"false", which every
+    # caller happily read as "deleted" — the group stayed put and the app said
+    # otherwise. Refusals are now real HTTP errors.
+    if result.get("success") != "true":
+        message = result.get("message", "Could not delete this group")
+        if "not found" in message.lower():
+            raise HTTPException(status_code=404, detail=message)
+        raise HTTPException(status_code=409, detail=message)
     return result
 
 

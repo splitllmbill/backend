@@ -28,10 +28,17 @@ class UserResponse(BaseModel):
     upiId: str = ""
     role: str = "user"
     invitedBy: Optional[str] = None
+    status: str = "active"
 
 
 class ChangePasswordRequest(BaseModel):
     password: str
+
+
+class ActivateRequest(BaseModel):
+    """Invite code redeemed by an account that signed up without one."""
+
+    inviteCode: str = ""
 
 
 # ─── Account ────────────────────────────────────────────────────────────

@@ -59,17 +59,20 @@ async def get_verified_identity(
     return {"uid": uid, "email": email, "name": name}
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+async def get_account_user(
+    # Declared as a dependency rather than called inline so it sits in
+    # FastAPI's graph, where it can be overridden (tests) and cached across
+    # the several dependencies of one request.
+    identity: dict = Depends(get_verified_identity),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> dict:
-    """
-    FastAPI dependency that verifies a Supabase JWT token using asymmetric JWKS.
-    Also ensures the user exists in the local MongoDB.
-    Returns a dict with 'uid' and 'email'.
-    """
-    identity = await get_verified_identity(credentials)
+    """Verified identity plus its MongoDB account, with no status check.
 
+    For the handful of routes that must keep working while an account is
+    gated: reading your own profile (so the app can tell you *why* you are
+    stuck), redeeming an invite code, deleting the account, and signing out.
+    Everything else wants get_current_user.
+    """
     # Sync user to MongoDB
     user = await user_service.find_or_create_user(
         db, uid=identity["uid"], email=identity["email"], name=identity["name"]
@@ -79,8 +82,44 @@ async def get_current_user(
         "uid": identity["uid"],
         "email": identity["email"],
         "name": identity["name"],
-        "role": user.get("role", "user")
+        "role": user.get("role", "user"),
+        "status": user_service.account_status(user),
     }
+
+
+# Why each gated status is refused, in the words the app shows the person.
+_BLOCKED_REASON = {
+    user_service.STATUS_PENDING: (
+        "This account needs an invite code before it can be used."
+    ),
+    user_service.STATUS_INACTIVE: (
+        "This account has been deactivated. Contact an administrator."
+    ),
+}
+
+
+async def get_current_user(
+    user: dict = Depends(get_account_user),
+) -> dict:
+    """
+    FastAPI dependency that verifies a Supabase JWT token using asymmetric JWKS.
+    Also ensures the user exists in the local MongoDB.
+    Returns a dict with 'uid' and 'email'.
+
+    Anything other than an active account is refused here, which is what makes
+    "inactive" mean something: every route that takes this dependency — which
+    is every route that touches data — is closed to them at once.
+    """
+    status = user.get("status", user_service.STATUS_ACTIVE)
+    if status != user_service.STATUS_ACTIVE:
+        raise HTTPException(
+            status_code=403,
+            detail=_BLOCKED_REASON.get(status, "This account is not active."),
+            # Lets the app route straight to the unblock screen instead of
+            # pattern-matching on prose.
+            headers={"X-Account-Status": status},
+        )
+    return user
 
 async def get_admin_user(
     current_user: dict = Depends(get_current_user)

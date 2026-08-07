@@ -49,6 +49,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Browsers hide every non-simple response header from JS unless it is
+    # named here, and the web build reads this one to tell a pending account
+    # apart from a deactivated one.
+    expose_headers=["X-Account-Status"],
 )
 
 

@@ -22,6 +22,14 @@ async def _seed_database(db: AsyncIOMotorDatabase):
     import pymongo
     await db.users.create_index([("firebaseUid", pymongo.ASCENDING)], unique=True, sparse=True)
     await db.users.create_index([("friendCode", pymongo.ASCENDING)], unique=True, sparse=True)
+    # Group join links are looked up by code, and must be unique.
+    await db.event.create_index(
+        [("joinCode", pymongo.ASCENDING)], unique=True, sparse=True
+    )
+    # One tally per (owner, token); the global tally has userId: null.
+    await db.category_hints.create_index(
+        [("userId", pymongo.ASCENDING), ("token", pymongo.ASCENDING)], unique=True
+    )
 
 async def connect_to_mongo():
     """Initialize MongoDB connection on app startup.

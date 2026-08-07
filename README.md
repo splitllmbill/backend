@@ -107,6 +107,8 @@ Once running, visit:
 | Import | POST | `/db/import/splitwise/preview` | ✅ |
 | Import | POST | `/db/import/splitwise` | ✅ |
 | Expenses | POST | `/db/expense` | ✅ |
+| Expenses | GET | `/db/expense/category-suggestion` | ✅ |
+| Expenses | GET | `/db/categories` | ❌ |
 | Expenses | GET | `/db/expense/:id` | ✅ |
 | Expenses | PUT | `/db/expense/:id` | ✅ |
 | Expenses | DELETE | `/db/expense/:id` | ✅ |
@@ -150,6 +152,24 @@ A join code also works as a signup invite (`inviteCode` on `/db/signup`), which
 is what makes a group link usable by someone with no account yet.
 `GET /db/invite/validate?code=` checks either kind of code without auth — Google
 sign-in has to validate before the OAuth redirect, when there is no session.
+
+## Categories
+
+`category_service.CATEGORIES` is the single category vocabulary — the Flutter
+pickers and the receipt-scanner prompt all read from it, and `normalize()` folds
+older spellings, Splitwise's names and scanner output onto it on every write.
+
+Suggestions (`GET /db/expense/category-suggestion?name=`) come from three
+places, best first:
+
+1. **You** — what this person filed a title like this under before.
+2. **Everyone** — the same, aggregated. This is the part that grows: saving or
+   correcting an expense increments a tally in `category_hints`, keyed by the
+   whole title (weighted ×3) and by each meaningful word in it.
+3. **Keywords** — a static seed table, so a fresh install still guesses well.
+
+A correction outvotes the old answer over time rather than needing to erase it,
+and settlements never teach the table. No model is involved; it is counting.
 
 ## Importing
 

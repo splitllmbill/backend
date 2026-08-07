@@ -125,6 +125,19 @@ async def update_event(
     try:
         result = await event_service.save_event(db, user_id, request_data)
         return result
+    except CurrencyChangeRequiresChoice as e:
+        # Re-pricing a group's history is the caller's call, not ours. 409 with
+        # the numbers behind the question, so the app can ask it: answering
+        # means retrying with applyToExpenses set either way.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "currency_change_requires_choice",
+                "expenseCount": e.expense_count,
+                "fromCurrency": e.from_currency,
+                "toCurrency": e.to_currency,
+            },
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

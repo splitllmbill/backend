@@ -1047,6 +1047,103 @@ async def get_event_dues(db: AsyncIOMotorDatabase, event_id: str) -> dict:
     }
 
 
+async def get_event_summary(
+    db: AsyncIOMotorDatabase, event_id: str, user_id: str
+) -> dict:
+    """Per-member spend/paid totals for an event, plus the group total.
+
+    Three different questions, which a single "balance" number conflates:
+
+    * ``paid`` — what someone put on the table;
+    * ``spend`` — their own share of the bills, i.e. what the group cost them;
+    * ``net`` — the difference, positive when the group still owes them.
+
+    Settling up is tracked separately and kept out of ``spend``, so squaring a
+    debt moves ``net`` towards zero without ever looking like the group
+    consumed something. Dues answer "who pays whom"; this answers "where did
+    the money go", and the two are not the same question.
+    """
+    event = await db.event.find_one({"_id": ObjectId(event_id)})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    expense_ids = [
+        ref if isinstance(ref, ObjectId) else ObjectId(ref)
+        for ref in event.get("expenses", [])
+    ]
+    expenses = await db.expense.find({"_id": {"$in": expense_ids}}).to_list(
+        length=None
+    )
+
+    paid: dict[str, float] = {}
+    spend: dict[str, float] = {}
+    # Money moved between members to square up. Positive = paid out.
+    settled: dict[str, float] = {}
+    group_total = 0.0
+
+    for expense in expenses:
+        is_settlement = expense.get("type") == "settle"
+
+        for pay_share in expense.get("payShares", []):
+            member_id = str(pay_share["userId"])
+            amount = float(pay_share.get("amount", 0))
+            if is_settlement:
+                settled[member_id] = settled.get(member_id, 0.0) + amount
+            else:
+                paid[member_id] = paid.get(member_id, 0.0) + amount
+                group_total += amount
+
+        for share in expense.get("shares", []):
+            member_id = str(share["userId"])
+            amount = float(share.get("amount", 0))
+            if is_settlement:
+                # The receiving side of a settlement.
+                settled[member_id] = settled.get(member_id, 0.0) - amount
+            else:
+                spend[member_id] = spend.get(member_id, 0.0) + amount
+
+    member_oids = [
+        ref if isinstance(ref, ObjectId) else ObjectId(ref)
+        for ref in event.get("users", [])
+    ]
+    # One query for every name, rather than one per member.
+    docs = await db.users.find(
+        {"_id": {"$in": member_oids}}, {"name": 1}
+    ).to_list(length=None)
+    names = {str(d["_id"]): d.get("name", "Unknown") for d in docs}
+
+    members = []
+    for oid in member_oids:
+        member_id = str(oid)
+        member_paid = round(paid.get(member_id, 0.0), 2)
+        member_spend = round(spend.get(member_id, 0.0), 2)
+        member_settled = round(settled.get(member_id, 0.0), 2)
+        members.append(
+            {
+                "id": member_id,
+                "name": names.get(member_id, "Unknown"),
+                "isYou": member_id == str(user_id),
+                "paid": member_paid,
+                "spend": member_spend,
+                "settled": member_settled,
+                # Positive when the group still owes them. Settling up moves
+                # this towards zero without touching what anyone spent.
+                "net": round(member_paid - member_spend + member_settled, 2),
+            }
+        )
+
+    members.sort(key=lambda m: m["spend"], reverse=True)
+
+    return {
+        "eventId": str(event["_id"]),
+        "eventName": event.get("eventName", ""),
+        "currency": event.get("currency", settings.DEFAULT_CURRENCY),
+        "groupTotal": round(group_total, 2),
+        "expenseCount": sum(1 for e in expenses if e.get("type") != "settle"),
+        "members": members,
+    }
+
+
 async def get_event_dues_for_user(
     db: AsyncIOMotorDatabase, event_id: str, user_id: str
 ) -> dict:

@@ -3,6 +3,7 @@ import traceback
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.config import settings
 from datetime import datetime, timezone
+from .category_service import CATEGORIES
 from .llm.provider_base import BaseLLMProvider
 from .llm.catalyst_provider import CatalystLLMProvider
 
@@ -147,11 +148,10 @@ code fences, no commentary) with these keys:
 - "amount": grand total as a number
 - "currency": ISO 4217 code inferred from the receipt (e.g. "INR", "USD")
 - "date": receipt date as YYYY-MM-DD, or null if unreadable
-- "category": one of "Dining out", "Groceries", "Taxi", "Travel", "Shopping",
-  "Entertainment", "Utilities", "Health", "General"
+- "category": one of CATEGORY_LIST
 - "items": array of {"name": string, "amount": number} line items (may be [])
 If the image is not a receipt, respond with {"error": "not a receipt"}.
-"""
+""".replace("CATEGORY_LIST", ", ".join(f'"{c}"' for c in CATEGORIES))
 
 
 async def process_expense_from_receipt(

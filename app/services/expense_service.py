@@ -3,7 +3,7 @@ from bson import ObjectId
 from fastapi import HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.config import settings
-from app.services import audit_service, fx_service
+from app.services import audit_service, category_service, fx_service
 from app.services.user_service import serialize_doc
 
 
@@ -133,6 +133,9 @@ async def create_expense(
         }
 
     expense_type = request_data.get("type", "normal")
+    # Settlements carry their own marker rather than a spending category.
+    if expense_type != "settle":
+        category = category_service.normalize(category)
     shares = request_data.get("shares", [])
     pay_shares = request_data.get("payShares", [])
 
@@ -267,6 +270,10 @@ async def create_expense(
         summary=_expense_summary(new_expense),
         after=audit_service.snapshot(new_expense),
     )
+
+    # Teaches the category table what this title is usually filed under.
+    if expense_type != "settle":
+        await category_service.learn(db, expense_name, category, user_id)
 
     return {
         "message": "Expense created!",
@@ -423,6 +430,9 @@ async def update_expense(
             tables=await fx_service.context_rate_tables(db, user_id, event),
         )
 
+    if expense.get("type") != "settle":
+        category = category_service.normalize(category)
+
     update_data = {
         "expenseName": expense_name,
         "amount": round(float(amount) * fx_rate, 2),
@@ -490,6 +500,11 @@ async def update_expense(
         before=audit_service.snapshot(expense),
         after=audit_service.snapshot(updated),
     )
+
+    # A correction is the most valuable signal the table gets.
+    if expense.get("type") != "settle":
+        await category_service.learn(db, expense_name, category, user_id)
+
     return {"message": "Successfully updated expense", "success": "true"}
 
 

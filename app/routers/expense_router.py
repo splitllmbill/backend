@@ -3,10 +3,42 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_current_user
 from app.database import get_db
-from app.services import email_service, expense_service, user_service
+from app.services import (
+    category_service,
+    email_service,
+    expense_service,
+    user_service,
+)
 from app.models.schemas import PersonalExpensesRequest, ExpenseCreate, ExpenseUpdate
 
 router = APIRouter()
+
+
+@router.get("/categories")
+async def list_categories():
+    """The one category vocabulary (no auth: static reference data)."""
+    return {
+        "default": category_service.DEFAULT_CATEGORY,
+        "categories": category_service.CATEGORIES,
+    }
+
+
+@router.get("/expense/category-suggestion")
+async def suggest_category(
+    name: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Guess a category from the expense title.
+
+    Answers from what this person has filed under that title before, then what
+    everyone has, then a seed keyword table — see category_service. Returns
+    ``{"category": null}`` when nothing is known, which means "leave their
+    choice alone" rather than "General".
+    """
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    suggestion = await category_service.suggest(db, name, user_id)
+    return suggestion or {"category": None, "source": None, "confidence": 0.0}
 
 
 async def _notify_expense_members(

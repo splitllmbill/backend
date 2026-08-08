@@ -39,6 +39,7 @@ async def setup_database():
     await db.users.delete_many({})
     await db.event.delete_many({})
     await db.expense.delete_many({})
+    await db.category_hints.delete_many({})
     
     # Pre-seed a test user
     from app.services.user_service import find_or_create_user
@@ -50,6 +51,7 @@ async def setup_database():
     await db.users.delete_many({})
     await db.event.delete_many({})
     await db.expense.delete_many({})
+    await db.category_hints.delete_many({})
     
     await close_mongo_connection()
 

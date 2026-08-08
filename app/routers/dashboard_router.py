@@ -27,6 +27,20 @@ async def get_dashboard_summary(
     return {"message": "No data found"}
 
 
+@router.get("/dashboard/trends")
+async def get_spend_trends(
+    months: int = 6,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Monthly spend split personal vs group, plus per-category series."""
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return await dashboard_service.get_spend_trends(db, user_id, months)
+
+
 @router.post("/dashboard/chart")
 async def get_dashboard_chart(
     request: DashboardRequest,

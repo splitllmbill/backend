@@ -173,6 +173,19 @@ places, best first:
 A correction outvotes the old answer over time rather than needing to erase it,
 and settlements never teach the table. No model is involved; it is counting.
 
+### Importing
+
+`POST /db/import/splitwise` creates a group from a Splitwise export. Members
+that are not mapped to an account or an email become name-only placeholders, so
+the import runs without identifying everyone up front.
+
+Passing `eventId` instead of `eventName` imports into an existing group and adds
+**only the rows that are not already there** — each expense stores an
+`importKey` fingerprint of its source row, so re-exporting after a trip tops the
+group up rather than duplicating it. Rows imported before fingerprints existed
+are matched on a looser key (date, description, cost, currency). The preview
+endpoint reports `newRowCount` / `duplicateRowCount` up front.
+
 ### Credit-card reminders
 
 `credit_cards` stores a name, optional last four digits, and the **day of the

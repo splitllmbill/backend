@@ -845,22 +845,57 @@ async def join_event_by_code(
 
 
 async def delete_event(
-    db: AsyncIOMotorDatabase, event_id: str, user_id: str | None = None
+    db: AsyncIOMotorDatabase,
+    event_id: str,
+    user_id: str | None = None,
+    force: bool = False,
 ) -> dict:
-    """Delete an event and its expenses (if no unsettled dues)."""
+    """Delete an event and its expenses, unless money is still owed inside it.
+
+    A refusal is a real error. This used to answer HTTP 200 with
+    ``success: "false"`` — a *string*, and a truthy one — so every caller read
+    it as success: the app announced the deletion and navigated away from a
+    group that was still there.
+
+    ``force`` skips the balance check, and is only for the group's creator.
+    Deleting a group with live debts destroys the record of who owed whom, so
+    it needs someone who can be said to own that decision; it exists mainly so
+    a throwaway test group is not immortal.
+    """
     event = await db.event.find_one({"_id": ObjectId(event_id)})
     if not event:
-        return {"message": "Event not found", "success": "false"}
+        raise HTTPException(status_code=404, detail="Event not found")
 
-    # Check for unsettled dues
-    dues = await get_event_dues(db, event_id)
-    if dues and "eventDues" in dues:
-        for due in dues["eventDues"]:
-            if due.get("creditorDetails") and len(due["creditorDetails"]) > 0:
-                return {
-                    "message": "Cannot delete event. There are unsettled dues.",
-                    "success": "false",
-                }
+    if force and str(event.get("createdBy")) != str(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the person who created this group can force-delete it.",
+        )
+
+    if not force:
+        outstanding = []
+        dues = await get_event_dues(db, event_id)
+        for due in (dues or {}).get("eventDues", []):
+            for creditor in due.get("creditorDetails", []) or []:
+                outstanding.append(
+                    {
+                        "debtor": due.get("debtor", "Someone"),
+                        "creditor": creditor.get("name", "someone"),
+                        "amount": creditor.get("amount", 0),
+                    }
+                )
+        if outstanding:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "event_has_unsettled_dues",
+                    "message": "This group still has unsettled balances.",
+                    # Naming them turns "it failed" into something actionable.
+                    "outstanding": outstanding,
+                    "expenseCount": len(event.get("expenses", [])),
+                    "canForce": str(event.get("createdBy")) == str(user_id),
+                },
+            )
 
     # Snapshot the expenses before deleting them: undoing the group deletion
     # has to bring its history back, not just an empty group.

@@ -89,16 +89,20 @@ async def update_event(
 @router.delete("/event/{event_id}")
 async def delete_event(
     event_id: str,
+    force: bool = False,
     current_user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """Delete an event and its associated expenses."""
+    """Delete an event and its associated expenses.
+
+    Refused with 409 while anyone still owes anyone inside it. ``force=true``
+    overrides that, and only the group's creator may use it.
+    """
     user_id = await user_service.get_user_internal_id(db, current_user["uid"])
     if not user_id or not await event_service.is_event_member(db, event_id, user_id):
         raise HTTPException(status_code=404, detail="Event not found")
 
-    result = await event_service.delete_event(db, event_id, user_id)
-    return result
+    return await event_service.delete_event(db, event_id, user_id, force=force)
 
 
 @router.get("/event/{event_id}/invite")

@@ -7,6 +7,7 @@ from app.services import (
     category_service,
     email_service,
     expense_service,
+    recurring_service,
     user_service,
 )
 from app.models.schemas import PersonalExpensesRequest, ExpenseCreate, ExpenseUpdate
@@ -175,6 +176,10 @@ async def get_personal_expenses(
     user_id = await user_service.get_user_internal_id(db, current_user["uid"])
     if not user_id:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Post any subscription that has fallen due first, so opening the list is
+    # also what catches it up. The hourly loop covers users who never look.
+    await recurring_service.post_due(db, user_id=user_id)
 
     request_data = await request.json()
     result = await expense_service.get_all_expenses_for_user(db, user_id, request_data)

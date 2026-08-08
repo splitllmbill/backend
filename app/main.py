@@ -29,6 +29,7 @@ from app.routers import (
     import_router,
     version_router,
 )
+from app.routers import recurring_router
 
 
 #: How often the reminder loop wakes. Hourly rather than daily so a container
@@ -39,13 +40,17 @@ _REMINDER_INTERVAL_SECONDS = 60 * 60
 
 
 async def _reminder_loop():
-    """Send credit-card bill reminders that have come due."""
-    from app.services import card_service
+    """Post what has come due: card reminders, and recurring expenses."""
+    from app.services import card_service, recurring_service
 
     while True:
         try:
             await card_service.send_due_reminders(get_db())
             await card_service.purge_old_reminder_logs(get_db())
+            # Subscriptions that have come due. Same safety properties as the
+            # reminders above: de-duplicated in the database, so waking often
+            # costs a query and charges nobody twice.
+            await recurring_service.post_due(get_db())
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -149,6 +154,9 @@ app.include_router(activity_router.router, prefix="/db", tags=["Activity"])
 
 # Credit-card bill reminder routes: /db/cards
 app.include_router(card_router.router, prefix="/db", tags=["Cards"])
+
+# Subscriptions and other repeating expenses
+app.include_router(recurring_router.router, prefix="/db", tags=["Recurring"])
 
 # Version route: /version (public; drives the in-app update prompt)
 app.include_router(version_router.router, tags=["Version"])

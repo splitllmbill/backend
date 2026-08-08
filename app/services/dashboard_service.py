@@ -181,6 +181,133 @@ async def get_summary_for_homepage(
     }
 
 
+def _month_keys(count: int, today: datetime.date | None = None) -> list[str]:
+    """The last ``count`` months as YYYY-MM, oldest first, including this one."""
+    today = today or datetime.datetime.now(datetime.timezone.utc).date()
+    keys, year, month = [], today.year, today.month
+    for _ in range(count):
+        keys.append(f"{year:04d}-{month:02d}")
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+    return list(reversed(keys))
+
+
+def _month_of(value) -> str | None:
+    """Bucket key for an expense's date, whatever shape it was stored in."""
+    if isinstance(value, datetime.datetime):
+        return f"{value.year:04d}-{value.month:02d}"
+    text = str(value or "")
+    # ISO-ish strings sort and slice correctly; anything else is unusable.
+    return text[:7] if len(text) >= 7 and text[4] == "-" else None
+
+
+async def get_spend_trends(
+    db: AsyncIOMotorDatabase, user_id: str, months: int = 6
+) -> dict:
+    """What you spent per month, split personal vs group, and by category.
+
+    "Your spend" is defined exactly as the homepage summary defines it, so the
+    two never disagree: personal expenses count what you *paid*, and group or
+    friend expenses count your *share* of the bill. Settling up is not spending
+    and is excluded from both.
+
+    Note this is a wider net than the category pie, which only ever looked at
+    personal expenses — group spend was simply invisible there.
+    """
+    # Clamp rather than reject: a nonsense window should still draw something.
+    # Note `or 6` would be wrong here — it would turn an explicit 0 into 6.
+    months = max(1, min(int(6 if months is None else months), 24))
+    keys = _month_keys(months)
+    oldest = datetime.datetime(
+        int(keys[0][:4]), int(keys[0][5:]), 1, tzinfo=datetime.timezone.utc
+    )
+
+    user = await db.users.find_one(
+        {"_id": ObjectId(user_id)}, {"defaultCurrency": 1, "fxRates": 1}
+    )
+    viewer_currency = fx_service.normalize_currency(
+        (user or {}).get("defaultCurrency")
+    )
+    viewer_rates = ((user or {}).get("fxRates"), viewer_currency)
+    oid = ObjectId(user_id)
+
+    # Naive datetimes are still in the data, and comparing those against an
+    # aware bound raises inside Mongo's date handling on some documents, so the
+    # range is filtered in Python after a cheap participation match.
+    personal = await db.expense.find(
+        {"type": "normal", "payShares.userId": oid},
+        {"payShares": 1, "date": 1, "category": 1, "baseCurrency": 1},
+    ).to_list(length=None)
+    shared = await db.expense.find(
+        {"type": {"$in": ["group", "friend"]}, "shares.userId": oid},
+        {"shares": 1, "date": 1, "category": 1, "baseCurrency": 1},
+    ).to_list(length=None)
+
+    bases = {
+        fx_service.normalize_currency(e.get("baseCurrency"))
+        for e in personal + shared
+    }
+    rates = await fx_service.get_rates_to(
+        viewer_currency, bases, db=db, tables=[viewer_rates]
+    )
+
+    wanted = set(keys)
+    per_month = {k: {"personal": 0.0, "group": 0.0} for k in keys}
+    per_category: dict[str, dict[str, float]] = {}
+
+    def _record(expense, entries, bucket: str):
+        month = _month_of(expense.get("date"))
+        if month not in wanted:
+            return
+        rate = rates.get(
+            fx_service.normalize_currency(expense.get("baseCurrency")), 1.0
+        )
+        amount = sum(
+            float(entry.get("amount", 0)) for entry in entries
+            if str(entry.get("userId")) == user_id
+        ) * rate
+        if amount == 0:
+            return
+        per_month[month][bucket] += amount
+        category = expense.get("category") or "Uncategorised"
+        by_month = per_category.setdefault(category, {})
+        by_month[month] = by_month.get(month, 0.0) + amount
+
+    for expense in personal:
+        _record(expense, expense.get("payShares", []), "personal")
+    for expense in shared:
+        _record(expense, expense.get("shares", []), "group")
+
+    # Biggest categories first; the long tail is noise on a chart.
+    categories = sorted(
+        (
+            {
+                "category": name,
+                "total": round(sum(by_month.values()), 2),
+                "values": [round(by_month.get(k, 0.0), 2) for k in keys],
+            }
+            for name, by_month in per_category.items()
+        ),
+        key=lambda c: -c["total"],
+    )
+
+    personal_series = [round(per_month[k]["personal"], 2) for k in keys]
+    group_series = [round(per_month[k]["group"], 2) for k in keys]
+
+    return {
+        "currency": viewer_currency,
+        "months": keys,
+        "personal": personal_series,
+        "group": group_series,
+        "total": [
+            round(p + g, 2) for p, g in zip(personal_series, group_series)
+        ],
+        "grandTotal": round(sum(personal_series) + sum(group_series), 2),
+        "categories": categories,
+    }
+
+
 async def get_dashboard_chart(
     db: AsyncIOMotorDatabase, user_id: str, request_data: dict
 ) -> list:

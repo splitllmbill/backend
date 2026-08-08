@@ -1,9 +1,14 @@
 from fastapi import APIRouter, Body, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from app.auth import get_current_user, get_verified_identity
+from app.auth import get_account_user, get_current_user, get_verified_identity
 from app.database import get_db
 from app.services import user_service
-from app.models.schemas import LoginRequest, SignupRequest, ChangePasswordRequest
+from app.models.schemas import (
+    ActivateRequest,
+    ChangePasswordRequest,
+    LoginRequest,
+    SignupRequest,
+)
 
 router = APIRouter()
 
@@ -32,6 +37,7 @@ async def login(
         email=identity["email"],
         name=identity.get("name", ""),
         invite_code=request.inviteCode,
+        allow_pending=True,
     )
     return user
 
@@ -53,12 +59,31 @@ async def signup(
         email=identity["email"],
         name=request.name,
         invite_code=request.inviteCode,
+        allow_pending=True,
     )
     return user
 
 
+@router.post("/activate")
+async def activate(
+    request: ActivateRequest,
+    current_user: dict = Depends(get_account_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Redeem an invite code for an account that was created without one.
+
+    Signing up without a code no longer turns anyone away — it parks them in a
+    pending account that can see nothing. This is how they get out of it, and
+    it takes the un-gated dependency because by definition the caller is gated.
+    """
+    return await user_service.activate_with_invite(
+        db, current_user["uid"], request.inviteCode
+    )
+
+
+# Signing out must work whatever state the account is in.
 @router.post("/logout")
-async def logout(current_user: dict = Depends(get_current_user)):
+async def logout(current_user: dict = Depends(get_account_user)):
     """Logout acknowledgement. Firebase tokens are stateless."""
     return {"message": "Logged out"}
 

@@ -3,7 +3,8 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_admin_user
 from app.database import get_db
 from app.models.schemas import AdminModelUpdate
-from app.services.user_service import serialize_doc
+from app.services import user_service
+from app.services.user_service import serialize_doc, with_status
 from datetime import datetime, timezone
 import httpx
 from app.config import settings
@@ -15,10 +16,47 @@ async def list_users(
     admin_user: dict = Depends(get_admin_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """List all users (Admin only)"""
-    cursor = db.users.find().sort("createdAt", -1)
+    """List all users (Admin only).
+
+    Deleted accounts are left out: they are anonymised tombstones kept only so
+    other people's shared expenses still resolve, and there is nothing left on
+    them to administer.
+    """
+    cursor = db.users.find({"isDeleted": {"$ne": True}}).sort("createdAt", -1)
     users = await cursor.to_list(length=1000)
-    return [serialize_doc(user) for user in users]
+    return [with_status(serialize_doc(user)) for user in users]
+
+
+@router.get("/users/tree")
+async def users_tree(
+    admin_user: dict = Depends(get_admin_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Who invited whom, as a forest (Admin only).
+
+    Declared before /users/{uid} so the literal path wins the match.
+    """
+    return await user_service.build_invite_tree(db)
+
+
+@router.put("/users/{uid}/status")
+async def set_user_status(
+    uid: str,
+    update_data: dict = Body(...),
+    admin_user: dict = Depends(get_admin_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Switch an account on or off (Admin only).
+
+    Deactivating closes every data route to that person at once — see the
+    status check in get_current_user.
+    """
+    status = (update_data.get("status") or "").strip().lower()
+    if uid == admin_user["uid"] and status != "active":
+        raise HTTPException(
+            status_code=400, detail="You cannot deactivate your own account"
+        )
+    return await user_service.set_account_status(db, uid, status)
 
 @router.put("/users/{uid}")
 async def edit_user(

@@ -39,6 +39,12 @@ class ChangePasswordRequest(BaseModel):
     password: str = ""
 
 
+class ActivateRequest(BaseModel):
+    """Invite code redeemed by an account that signed up without one."""
+
+    inviteCode: str = ""
+
+
 # ─── Account ────────────────────────────────────────────────────────────
 
 class UpdateAccountRequest(BaseModel):

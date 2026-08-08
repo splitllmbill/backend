@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from app.auth import get_current_user
+from app.auth import get_account_user, get_current_user
 from app.database import get_db
 from app.services import email_service, user_service
 from app.models.schemas import UpdateAccountRequest
@@ -15,7 +15,9 @@ router = APIRouter()
 
 @router.get("/user/account")
 async def get_account(
-    current_user: dict = Depends(get_current_user),
+    # Un-gated on purpose: a pending or deactivated account still needs to
+    # read its own profile, or the app cannot tell the person why it is stuck.
+    current_user: dict = Depends(get_account_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Get current user's profile."""
@@ -46,7 +48,8 @@ async def update_account(
 
 @router.delete("/user/account")
 async def delete_account(
-    current_user: dict = Depends(get_current_user),
+    # Also un-gated: being locked out must never mean being unable to leave.
+    current_user: dict = Depends(get_account_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Permanently delete the current user's account (store-required flow)."""
@@ -63,9 +66,11 @@ async def get_invites(
 ):
     """Get list of users invited by the current user."""
     account = await user_service.get_user_account(db, current_user["uid"])
-    if not account or not account.get("friendCode"):
+    if not account:
         return []
-    invites = await user_service.get_invited_users(db, account["friendCode"])
+    invites = await user_service.get_invited_users(
+        db, account.get("friendCode", ""), account.get("id")
+    )
     return invites
 
 @router.post("/user/phantom")

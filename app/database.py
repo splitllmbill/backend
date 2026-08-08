@@ -63,6 +63,21 @@ async def _seed_database(db: AsyncIOMotorDatabase):
         unique=True,
     )
 
+    # Recurring expenses are read by owner and swept by due date.
+    await db.recurring_expense.create_index(
+        [("userId", pymongo.ASCENDING)]
+    )
+    await db.recurring_expense.create_index(
+        [("nextDueDate", pymongo.ASCENDING), ("paused", pymongo.ASCENDING)]
+    )
+    # This unique index *is* the recurring de-duplication: a second attempt to
+    # post the same (schedule, occurrence) fails the insert instead of charging
+    # the user twice. See recurring_service._claim.
+    await db.recurring_run.create_index(
+        [("recurringId", pymongo.ASCENDING), ("occurrenceDate", pymongo.ASCENDING)],
+        unique=True,
+    )
+
     # Drop the legacy `password` field. Supabase is the sole authenticator and
     # nothing here ever verified this hash, so it was a shadow copy of the
     # user's real credential. Idempotent: a no-op once every document is clean.

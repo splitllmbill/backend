@@ -208,6 +208,20 @@ async def get_event_expenses(
     return result
 
 
+@router.get("/event/{event_id}/summary")
+async def get_event_summary(
+    event_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Where the money went: group total, and each member's spend/paid/net."""
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id or not await event_service.is_event_member(db, event_id, user_id):
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    return await event_service.get_event_summary(db, event_id, user_id)
+
+
 @router.get("/user/event/{event_id}/dues")
 async def get_event_dues_for_user(
     event_id: str,

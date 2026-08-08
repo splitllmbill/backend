@@ -233,3 +233,16 @@ class UPILinkRequest(BaseModel):
 
 class FilterOptionsRequest(BaseModel):
     model: str = "expense"
+
+
+# ─── Bulk expense import ────────────────────────────────────────────────
+
+class BulkExpenseRequest(BaseModel):
+    """A batch of expenses from any producer — a chatbot, or a parsed statement.
+
+    ``payload`` takes either the parsed object or the raw text a chatbot
+    returned; the service copes with a ```json fence either way.
+    """
+
+    payload: object = None
+    eventId: Optional[str] = None

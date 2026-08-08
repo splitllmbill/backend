@@ -4,12 +4,18 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_current_user
 from app.database import get_db
 from app.services import (
+    bulk_expense_service,
     category_service,
     email_service,
     expense_service,
     user_service,
 )
-from app.models.schemas import PersonalExpensesRequest, ExpenseCreate, ExpenseUpdate
+from app.models.schemas import (
+    BulkExpenseRequest,
+    PersonalExpensesRequest,
+    ExpenseCreate,
+    ExpenseUpdate,
+)
 
 router = APIRouter()
 
@@ -179,3 +185,79 @@ async def get_personal_expenses(
     request_data = await request.json()
     result = await expense_service.get_all_expenses_for_user(db, user_id, request_data)
     return result
+
+
+# ─── Bulk import ────────────────────────────────────────────────────────
+#
+# One contract, three producers: our own model, a chatbot the person pasted a
+# prompt into, and a bank statement their device parsed. Preview and commit are
+# separate calls so nothing is written until the person has seen the rows.
+
+
+@router.get("/expense/bulk/prompt")
+async def get_bulk_prompt(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """The prompt to paste into whichever chatbot the person already uses."""
+    account = await user_service.get_user_account(db, current_user["uid"])
+    return {
+        "prompt": bulk_expense_service.build_prompt(
+            currency=(account or {}).get("defaultCurrency", "")
+        ),
+        "fields": bulk_expense_service.ROW_FIELDS,
+        "maxRows": bulk_expense_service.MAX_ROWS,
+    }
+
+
+@router.post("/expense/bulk/preview")
+async def preview_bulk_expenses(
+    request: BulkExpenseRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Check a batch and report exactly what would be created. Writes nothing."""
+    return bulk_expense_service.validate(request.payload)
+
+
+@router.post("/expense/bulk")
+async def create_bulk_expenses(
+    request: BulkExpenseRequest,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Create every row that validates, and report the ones that did not.
+
+    Re-validates rather than trusting the preview: the client may have edited
+    rows in between, and the preview is explicitly a read-only opinion.
+    """
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    checked = bulk_expense_service.validate(request.payload)
+    if not checked.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail=checked.get("error") or "Nothing in that batch could be imported.",
+        )
+
+    created, failed = [], []
+    for row in checked["rows"]:
+        if not row.get("ok"):
+            failed.append(row)
+            continue
+        data = dict(row["expense"])
+        # A personal expense is paid by, and owed by, its creator in full;
+        # create_expense fills the shares in. Group rows are not supported yet.
+        data["type"] = "normal"
+        result = await expense_service.create_expense(db, user_id, data)
+        if result.get("success") == "false":
+            failed.append({**row, "ok": False, "errors": [result.get("message", "rejected")]})
+        else:
+            created.append(result.get("expenseId") or result.get("id"))
+
+    return {
+        "imported": len(created),
+        "failed": len(failed),
+        "failedRows": failed,
+    }

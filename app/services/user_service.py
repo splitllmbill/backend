@@ -1,3 +1,4 @@
+import re
 import secrets
 import string
 from datetime import datetime, timezone
@@ -6,6 +7,13 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from fastapi import HTTPException
 
 from app.config import settings
+
+#: Two-letter country code (ISO 3166-1 alpha-2, e.g. "IN").
+_COUNTRY_RE = re.compile(r"^[A-Za-z]{2}$")
+#: Pragmatic email shape check — the same one used by the settlement
+#: service. PayPal rejects a malformed payee address with a clear API
+#: error anyway; this catches typos at save time.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def generate_friend_code(length: int = 8) -> str:
@@ -272,6 +280,11 @@ async def find_or_create_user(
         "name": name or email.split("@")[0],
         "friendCode": friend_code,
         "upiId": "",
+        # Settlement profile fields — empty until the user fills them in.
+        # country: ISO alpha-2 ("IN", "US", ...); paypalEmail: the PayPal
+        # account that receives settlements. See the settlement service.
+        "country": "",
+        "paypalEmail": "",
         "defaultCurrency": settings.DEFAULT_CURRENCY,
         "friends": [],
         "role": role,
@@ -567,6 +580,8 @@ async def get_user_account(db: AsyncIOMotorDatabase, uid: str) -> dict | None:
         "name": user.get("name", ""),
         "friendCode": friend_code,
         "upiId": user.get("upiId", ""),
+        "country": user.get("country", ""),
+        "paypalEmail": user.get("paypalEmail", ""),
         "defaultCurrency": user.get("defaultCurrency", settings.DEFAULT_CURRENCY),
         "fxRates": user.get("fxRates", {}),
         "uuid": friend_code,
@@ -579,7 +594,8 @@ async def get_user_account(db: AsyncIOMotorDatabase, uid: str) -> dict | None:
 async def update_user_account(
     db: AsyncIOMotorDatabase, uid: str, data: dict
 ) -> bool:
-    """Update user account fields (name, upiId, defaultCurrency)."""
+    """Update user account fields (name, upiId, defaultCurrency, country,
+    paypalEmail, fxRates)."""
     from app.services import fx_service
 
     update_fields = {"updatedAt": datetime.now(timezone.utc)}
@@ -587,6 +603,21 @@ async def update_user_account(
         update_fields["name"] = data["name"]
     if "upiId" in data and data["upiId"] is not None:
         update_fields["upiId"] = data["upiId"]
+    if data.get("country") is not None:
+        country = str(data["country"]).strip().upper()
+        if country and not _COUNTRY_RE.match(country):
+            raise HTTPException(
+                status_code=400,
+                detail="country must be a 2-letter ISO country code (e.g. IN, US)",
+            )
+        update_fields["country"] = country
+    if data.get("paypalEmail") is not None:
+        email = str(data["paypalEmail"]).strip()
+        if email and not _EMAIL_RE.match(email):
+            raise HTTPException(
+                status_code=400, detail="paypalEmail is not a valid email address"
+            )
+        update_fields["paypalEmail"] = email
     if data.get("defaultCurrency"):
         currency = data["defaultCurrency"].strip().upper()
         if currency not in fx_service.SUPPORTED_CURRENCIES:

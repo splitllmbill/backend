@@ -620,6 +620,12 @@ async def get_pending_settlements(
             "payeeName": names.get(str(r["payeeId"]), "Someone"),
             "amount": float(r.get("amount") or 0),
             "currency": r.get("currency", ""),
+            # Settlement rail: "paypal" or "upi" when the request was
+            # created through the settlement flow; absent for old manual
+            # claims. upiLink is the UPI intent link the payer scans/pays
+            # with — the creditor sees it here so they can remind the payer.
+            "rail": r.get("rail"),
+            "upiLink": r.get("upiLink"),
             # Only the person owed the money can confirm they received it.
             "awaitingYou": str(r["payeeId"]) == str(user_id),
             "createdAt": r["createdAt"].isoformat()

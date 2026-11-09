@@ -17,6 +17,21 @@ class Settings(BaseSettings):
     # lets account deletion remove the Supabase auth record.
     SUPABASE_SERVICE_ROLE_KEY: str = ""
 
+    # ── PayPal settlements (PayPal AI Hackathon entry) ─────────────────
+    # Standard REST app credentials from the PayPal Developer Dashboard
+    # (developer.paypal.com). Sandbox first; switch PAYPAL_ENVIRONMENT to
+    # "live" only with live credentials. Empty = PayPal settlements are
+    # unavailable (the endpoints return 503) — the rest of the app is
+    # unaffected. WEBHOOK_ID comes from the webhook registered in the
+    # dashboard; RETURN_URL / CANCEL_URL are the frontend pages PayPal
+    # sends the payer back to after approval / cancellation.
+    PAYPAL_CLIENT_ID: str = ""
+    PAYPAL_CLIENT_SECRET: str = ""
+    PAYPAL_ENVIRONMENT: str = "sandbox"
+    PAYPAL_WEBHOOK_ID: str = ""
+    PAYPAL_RETURN_URL: str = ""
+    PAYPAL_CANCEL_URL: str = ""
+
     # LLM feature is disabled by default so the app can deploy and run before the
     # QuickML endpoints are wired up. Set LLM_ENABLED=true once the Catalyst
     # QuickML endpoints below are configured.

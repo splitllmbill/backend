@@ -117,6 +117,11 @@ Once running, visit:
 | Settlements | GET | `/db/settlements` | ✅ |
 | Settlements | POST | `/db/settlements/:id/confirm` | ✅ |
 | Settlements | POST | `/db/settlements/:id/reject` | ✅ |
+| PayPal Settlements | POST | `/db/user/expense/friend/:id/settleup/paypal` | ✅ |
+| PayPal Settlements | POST | `/db/user/expense/friend/:id/settleup/upi` | ✅ |
+| PayPal Settlements | POST | `/db/settlements/paypal/:order_id/capture` | ✅ |
+| PayPal Settlements | GET | `/db/settlements/paypal/:order_id/status` | ✅ |
+| PayPal Settlements | POST | `/db/webhooks/paypal` | ✅ |
 | Activity | GET | `/db/activity` | ✅ |
 | Activity | POST | `/db/activity/:id/undo` | ✅ |
 | Cards | GET | `/db/cards` | ✅ |
@@ -150,6 +155,42 @@ from the debtor creates a pending `settlement_request` and returns
 When the creditor initiates, there is nobody left to confirm and it completes
 immediately (`status: "settled"`). Emails go to **both** parties, and only once
 the settlement is recorded — never on a pending request.
+
+### PayPal + UPI settlements (PayPal AI Hackathon entry)
+
+A debt is settled in full, debtor → creditor, over one of two rails, chosen
+from the two users' `country` fields (ISO alpha-2, set on the profile):
+
+- **PayPal** — `POST .../settleup/paypal` creates a PayPal Orders v2 order
+  with the creditor as `payee` and returns the Checkout approval URL. After
+  the debtor approves, `POST /db/settlements/paypal/:order_id/capture`
+  captures it; the server then re-fetches the order and only marks the debt
+  settled when it is COMPLETED for the exact amount — the client redirect
+  is never trusted. `POST /db/webhooks/paypal` is the production-grade path:
+  a signature-verified `PAYMENT.CAPTURE.COMPLETED` event settles the debt
+  even if the payer closed the browser. Never the Payouts API (business-only,
+  and its terms forbid friends-and-family use). The fee estimate is shown
+  before confirming (US domestic 3.49% + $0.49; cross-border 4.4% + $0.30
+  visible fee, plus ~3–4% FX markup and 18% GST described in the note).
+- **UPI** (India → India) — `POST .../settleup/upi` returns a `upi://pay`
+  intent link + a QR code (generated locally, no third-party service) and
+  records a pending `settlement_request` the creditor confirms with the
+  existing confirm endpoint. The payment happens in the payer's own UPI app;
+  there is no automatic confirmation (no UPI webhook exists).
+
+Routing: IN → IN = UPI (INR); non-IN → IN = PayPal USD (Indian accounts
+receive cross-border only, $10,000/receipt cap); IN → abroad = unavailable
+(Indian PayPal cannot send abroad); missing country = unavailable. An INR
+debt settles over PayPal in USD only when the payer has an explicit INR→USD
+rate on their account — an FX rate is never guessed for money movement. If
+the balance changed after the payment was created, the capture is verified
+but the debt is flagged `NEEDS_REVIEW` instead of auto-settling the wrong
+amount. PayPal credentials come from the environment only
+(`PAYPAL_CLIENT_ID` / `PAYPAL_CLIENT_SECRET` / `PAYPAL_ENVIRONMENT` /
+`PAYPAL_WEBHOOK_ID` / `PAYPAL_RETURN_URL` / `PAYPAL_CANCEL_URL`); with
+them unset the endpoints return 503 and the rest of the app is unaffected.
+Offline tests: `pytest tests/offline/test_paypal_settlements.py` (34 tests,
+mocked PayPal transport, in-memory fake DB — no live calls, no MongoDB).
 
 ### Activity log
 
@@ -209,6 +250,10 @@ reminders 10 and 5 days ahead. Sends are de-duplicated by a unique index on
 | `QUICKML_LLM_ENDPOINT` | QuickML GLM text endpoint (required when LLM enabled) | (empty) |
 | `QUICKML_VLM_ENDPOINT` | QuickML Qwen vision endpoint (receipts) | (empty) |
 | `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` / `OAUTH_REFRESH_TOKEN` | Zoho Self Client for QuickML auth | (empty) |
+| `PAYPAL_CLIENT_ID` / `PAYPAL_CLIENT_SECRET` | PayPal REST app credentials (Developer Dashboard; sandbox first) | (empty = PayPal settlements disabled, 503) |
+| `PAYPAL_ENVIRONMENT` | `sandbox` or `live` | `sandbox` |
+| `PAYPAL_WEBHOOK_ID` | Id of the webhook registered in the PayPal dashboard | (empty) |
+| `PAYPAL_RETURN_URL` / `PAYPAL_CANCEL_URL` | Frontend pages PayPal returns the payer to | (empty) |
 | `CORS_ORIGINS` | Comma-separated allowed origins (add the hosting domain) | `http://localhost:3000,...` |
 | `HOST` | Server host (local only) | `0.0.0.0` |
 | `PORT` | Server port (AppSail injects its own listen port) | `8081` |

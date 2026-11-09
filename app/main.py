@@ -31,6 +31,7 @@ from app.routers import (
 )
 from app.routers import recurring_router
 from app.routers import settings_router
+from app.routers import settlement_router
 
 
 #: How often the reminder loop wakes. Hourly rather than daily so a container
@@ -170,6 +171,11 @@ app.include_router(version_router.router, tags=["Version"])
 
 # Public site settings: /db/settings/public (unauthenticated)
 app.include_router(settings_router.router, prefix="/db", tags=["Settings"])
+
+# PayPal + UPI settlements (PayPal AI Hackathon entry). The settleup
+# endpoints live under /db next to the existing settle-up flow; the webhook
+# is unauthenticated by design (PayPal signature verification is the auth).
+app.include_router(settlement_router.router, prefix="/db", tags=["PayPal Settlements"])
 
 
 # ─── Health Check ───────────────────────────────────────────────────────

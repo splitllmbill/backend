@@ -31,6 +31,12 @@ class UserResponse(BaseModel):
     name: str
     friendCode: str
     upiId: str = ""
+    # Country of residence (ISO 3166-1 alpha-2, e.g. "IN", "US") and the
+    # PayPal account email. Both are optional and used only by the
+    # PayPal/UPI settlement flow — routing (UPI vs PayPal) and the PayPal
+    # payee override. Never exposed in the public user lists.
+    country: str = ""
+    paypalEmail: str = ""
     role: str = "user"
     invitedBy: Optional[str] = None
 
@@ -64,9 +70,44 @@ class UpdateAccountRequest(BaseModel):
     name: Optional[str] = None
     upiId: Optional[str] = None
     defaultCurrency: Optional[str] = None
+    # Country of residence (ISO 3166-1 alpha-2, e.g. "IN"). Drives settlement
+    # routing: India-to-India settles over UPI, everything else over PayPal.
+    country: Optional[str] = None
+    # PayPal account email that receives PayPal settlements (the payee
+    # override on the Orders API). Not shown to other users.
+    paypalEmail: Optional[str] = None
     # Personal FX table: {currency code: rate into defaultCurrency}. Used for
     # friend-to-friend and solo expenses, which have no group to inherit from.
     fxRates: Optional[dict[str, float]] = None
+
+
+# ─── PayPal / UPI settlements ─────────────────────────────────────────
+
+class StartPayPalSettlementRequest(BaseModel):
+    """Start a PayPal settlement for the caller's full debt to a friend.
+
+    ``creditorPaypalEmail`` / ``payerCountry`` / ``payeeCountry`` are
+    overrides for this one settlement; normally they come from the users'
+    profiles (``paypalEmail`` / ``country`` on the account).
+    """
+
+    note: Optional[str] = Field(default=None, max_length=120)
+    creditorPaypalEmail: Optional[str] = Field(default=None, max_length=254)
+    payerCountry: Optional[str] = Field(default=None, max_length=2)
+    payeeCountry: Optional[str] = Field(default=None, max_length=2)
+
+
+class StartUpiSettlementRequest(BaseModel):
+    """Start a UPI settlement for the caller's full debt to a friend.
+
+    ``creditorVpa`` overrides the creditor's saved UPI ID for this one
+    settlement; ``payerCountry`` / ``payeeCountry`` override the profiles.
+    """
+
+    note: Optional[str] = Field(default=None, max_length=80)
+    creditorVpa: Optional[str] = Field(default=None, max_length=64)
+    payerCountry: Optional[str] = Field(default=None, max_length=2)
+    payeeCountry: Optional[str] = Field(default=None, max_length=2)
 
 
 # ─── Dashboard ──────────────────────────────────────────────────────────
